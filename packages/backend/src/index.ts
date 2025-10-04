@@ -42,15 +42,77 @@ interface AnalysisResult {
     zerosCount: number;
     bitEntropy: number;
   };
+  entropyAnalysis: {
+    shannonEntropyPerBit: number;
+    minEntropyPerBit: number;
+    perPositionMinEntropy: number;
+    effectiveSecurityBits: number;
+    chiSquaredPValue: number;
+    serialCorrelation: number;
+    runsTestPValue: number;
+    lzCompressionRatio: number;
+    estimatedEntropyRate: number;
+    perPositionData?: Array<{
+      position: number;
+      entropy: number;
+      mostCommonChar: string;
+      frequency: number;
+    }>;
+  };
+  collisionAnalysis: {
+    exactDuplicates: number;
+    nearDuplicates: number;
+    averageHammingDistance: number;
+  };
   security: {
     overallRating: 'CRITICAL' | 'WARNING' | 'GOOD' | 'EXCELLENT';
     issues: string[];
     warnings: string[];
     strengths: string[];
+    effectiveBits: number;
+    recommendedMinimum: number;
   };
 }
 
 let tokenCaptures: TokenCapture[] = [];
+
+// Convert token to bit array
+function tokenToBits(token: string, encoding: 'hex' | 'base64' | 'raw' = 'raw'): number[] {
+  const bits: number[] = [];
+
+  if (encoding === 'hex' && /^[0-9a-fA-F]+$/.test(token)) {
+    for (let i = 0; i < token.length; i++) {
+      const val = parseInt(token[i] || '0', 16);
+      for (let j = 3; j >= 0; j--) {
+        bits.push((val >> j) & 1);
+      }
+    }
+  } else if (encoding === 'base64' && /^[A-Za-z0-9+/=]+$/.test(token)) {
+    // Decode base64 to binary
+    try {
+      const decoded = atob(token.replace(/=/g, ''));
+      for (let i = 0; i < decoded.length; i++) {
+        const byte = decoded.charCodeAt(i);
+        for (let j = 7; j >= 0; j--) {
+          bits.push((byte >> j) & 1);
+        }
+      }
+    } catch {
+      // Fall back to raw
+      return tokenToBits(token, 'raw');
+    }
+  } else {
+    // Raw byte encoding
+    for (let i = 0; i < token.length; i++) {
+      const byte = token.charCodeAt(i);
+      for (let j = 7; j >= 0; j--) {
+        bits.push((byte >> j) & 1);
+      }
+    }
+  }
+
+  return bits;
+}
 
 // Shannon entropy calculation
 function calculateEntropy(tokens: string[]): number {
@@ -73,6 +135,238 @@ function calculateEntropy(tokens: string[]): number {
   }
 
   return entropy;
+}
+
+// Min-entropy: H_min = -log2(max(p_i))
+function calculateMinEntropy(tokens: string[]): number {
+  if (tokens.length === 0) return 0;
+
+  const frequency = new Map<string, number>();
+  for (const token of tokens) {
+    frequency.set(token, (frequency.get(token) || 0) + 1);
+  }
+
+  const maxCount = Math.max(...frequency.values());
+  const maxProb = maxCount / tokens.length;
+
+  return -Math.log2(maxProb);
+}
+
+// Per-position min-entropy for fixed-length tokens
+function calculatePerPositionMinEntropy(tokens: string[]): { totalEntropy: number, positionData: Array<{ position: number, entropy: number, mostCommonChar: string, frequency: number }> } {
+  if (tokens.length === 0) return { totalEntropy: 0, positionData: [] };
+
+  // Check if all tokens are same length
+  const lengths = tokens.map(t => t.length);
+  const allSameLength = lengths.every(l => l === lengths[0]);
+
+  if (!allSameLength) {
+    // Fall back to global min-entropy
+    return { totalEntropy: calculateMinEntropy(tokens), positionData: [] };
+  }
+
+  const tokenLength = lengths[0] || 0;
+  let totalMinEntropy = 0;
+  const positionData: Array<{ position: number, entropy: number, mostCommonChar: string, frequency: number }> = [];
+
+  // For each position
+  for (let pos = 0; pos < tokenLength; pos++) {
+    const charFreq = new Map<string, number>();
+
+    for (const token of tokens) {
+      const char = token[pos] || '';
+      charFreq.set(char, (charFreq.get(char) || 0) + 1);
+    }
+
+    const maxCount = Math.max(...charFreq.values());
+    const maxProb = maxCount / tokens.length;
+    const posMinEntropy = -Math.log2(maxProb);
+
+    // Find the most common character at this position
+    let mostCommonChar = '';
+    for (const [char, count] of charFreq.entries()) {
+      if (count === maxCount) {
+        mostCommonChar = char;
+        break;
+      }
+    }
+
+    positionData.push({
+      position: pos,
+      entropy: posMinEntropy,
+      mostCommonChar,
+      frequency: maxProb
+    });
+
+    totalMinEntropy += posMinEntropy;
+  }
+
+  return { totalEntropy: totalMinEntropy, positionData };
+}
+
+// Chi-squared test for uniformity
+function chiSquaredTest(bits: number[]): number {
+  if (bits.length < 100) return 1.0; // Not enough data
+
+  const observed0 = bits.filter(b => b === 0).length;
+  const observed1 = bits.filter(b => b === 1).length;
+  const expected = bits.length / 2;
+
+  const chiSq = Math.pow(observed0 - expected, 2) / expected +
+                Math.pow(observed1 - expected, 2) / expected;
+
+  // Degrees of freedom = 1 for binary
+  // Approximate p-value for χ² distribution with df=1
+  // Using complementary error function approximation
+  const pValue = 1 - (1 - Math.exp(-chiSq / 2));
+
+  return Math.max(0, Math.min(1, pValue));
+}
+
+// Serial correlation coefficient for bit sequence
+function serialCorrelation(bits: number[]): number {
+  if (bits.length < 2) return 0;
+
+  let sum1 = 0, sum2 = 0, sum12 = 0;
+  const n = bits.length - 1;
+
+  for (let i = 0; i < n; i++) {
+    sum1 += bits[i] || 0;
+    sum2 += bits[i + 1] || 0;
+    sum12 += (bits[i] || 0) * (bits[i + 1] || 0);
+  }
+
+  const mean1 = sum1 / n;
+  const mean2 = sum2 / n;
+  const covariance = (sum12 / n) - (mean1 * mean2);
+
+  // Standard deviations
+  let var1 = 0, var2 = 0;
+  for (let i = 0; i < n; i++) {
+    var1 += Math.pow((bits[i] || 0) - mean1, 2);
+    var2 += Math.pow((bits[i + 1] || 0) - mean2, 2);
+  }
+  var1 /= n;
+  var2 /= n;
+
+  const stdDev = Math.sqrt(var1 * var2);
+
+  return stdDev === 0 ? 0 : covariance / stdDev;
+}
+
+// Runs test for randomness
+function runsTest(bits: number[]): number {
+  if (bits.length < 20) return 1.0;
+
+  // Count runs
+  let runs = 1;
+  for (let i = 1; i < bits.length; i++) {
+    if (bits[i] !== bits[i - 1]) runs++;
+  }
+
+  const n0 = bits.filter(b => b === 0).length;
+  const n1 = bits.filter(b => b === 1).length;
+  const n = bits.length;
+
+  // Expected runs and variance under null hypothesis
+  const expectedRuns = (2 * n0 * n1) / n + 1;
+  const variance = (2 * n0 * n1 * (2 * n0 * n1 - n)) / (n * n * (n - 1));
+
+  if (variance === 0) return 1.0;
+
+  const z = (runs - expectedRuns) / Math.sqrt(variance);
+
+  // Approximate p-value (two-tailed)
+  const pValue = 2 * (1 - normalCDF(Math.abs(z)));
+
+  return Math.max(0, Math.min(1, pValue));
+}
+
+// Standard normal CDF approximation
+function normalCDF(z: number): number {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const d = 0.3989423 * Math.exp(-z * z / 2);
+  const prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  return z > 0 ? 1 - prob : prob;
+}
+
+// LZ compression-based entropy estimate
+function lzEntropyEstimate(bits: number[]): number {
+  if (bits.length < 100) return 0;
+
+  // Simple LZ78-style compression
+  const dictionary = new Map<string, number>();
+  let dictionarySize = 1;
+  let currentString = '';
+  let compressedLength = 0;
+
+  for (const bit of bits) {
+    const newString = currentString + bit;
+
+    if (dictionary.has(newString)) {
+      currentString = newString;
+    } else {
+      dictionary.set(newString, dictionarySize++);
+      compressedLength += Math.ceil(Math.log2(dictionarySize));
+      currentString = String(bit);
+    }
+  }
+
+  // Entropy rate = compressed bits / original bits
+  return compressedLength / bits.length;
+}
+
+// Hamming distance between two strings
+function hammingDistance(s1: string, s2: string): number {
+  if (s1.length !== s2.length) return Math.max(s1.length, s2.length);
+
+  let distance = 0;
+  for (let i = 0; i < s1.length; i++) {
+    if (s1[i] !== s2[i]) distance++;
+  }
+  return distance;
+}
+
+// Collision and near-duplicate analysis
+function analyzeCollisions(tokens: string[]): { exactDuplicates: number; nearDuplicates: number; averageHammingDistance: number } {
+  if (tokens.length < 2) {
+    return { exactDuplicates: 0, nearDuplicates: 0, averageHammingDistance: 0 };
+  }
+
+  const seen = new Set<string>();
+  let exactDuplicates = 0;
+  let nearDuplicates = 0;
+  let totalDistance = 0;
+  let comparisons = 0;
+
+  // Check exact duplicates
+  for (const token of tokens) {
+    if (seen.has(token)) {
+      exactDuplicates++;
+    }
+    seen.add(token);
+  }
+
+  // Check near-duplicates (Hamming distance ≤ 2) and average distance
+  // Sample to avoid O(n²) on large sets
+  const sampleSize = Math.min(1000, tokens.length);
+  const step = Math.floor(tokens.length / sampleSize);
+
+  for (let i = 0; i < tokens.length; i += step) {
+    for (let j = i + step; j < tokens.length; j += step) {
+      const dist = hammingDistance(tokens[i] || '', tokens[j] || '');
+      totalDistance += dist;
+      comparisons++;
+
+      if (dist > 0 && dist <= 2) {
+        nearDuplicates++;
+      }
+    }
+  }
+
+  const averageHammingDistance = comparisons > 0 ? totalDistance / comparisons : 0;
+
+  return { exactDuplicates, nearDuplicates, averageHammingDistance };
 }
 
 // Bit-level entropy calculation
@@ -217,7 +511,9 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
       patterns: { sequential: false, sequentialCount: 0, hasTimestamps: false, commonPrefix: '', commonSuffix: '', predictabilityScore: 0 },
       characterAnalysis: { charset: '', alphabetic: 0, numeric: 0, special: 0, hexadecimal: false, base64: false },
       bitAnalysis: { totalBits: 0, onesCount: 0, zerosCount: 0, bitEntropy: 0 },
-      security: { overallRating: 'CRITICAL', issues: [`${errorType}:${errorMessage}`], warnings: [], strengths: [] }
+      entropyAnalysis: { shannonEntropyPerBit: 0, minEntropyPerBit: 0, perPositionMinEntropy: 0, effectiveSecurityBits: 0, chiSquaredPValue: 0, serialCorrelation: 0, runsTestPValue: 0, lzCompressionRatio: 0, estimatedEntropyRate: 0, perPositionData: [] },
+      collisionAnalysis: { exactDuplicates: 0, nearDuplicates: 0, averageHammingDistance: 0 },
+      security: { overallRating: 'CRITICAL', issues: [`${errorType}:${errorMessage}`], warnings: [], strengths: [], effectiveBits: 0, recommendedMinimum: 128 }
     };
   }
 
@@ -257,20 +553,143 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
   // Bit analysis
   const bitAnalysis = calculateBitEntropy(tokens);
 
+  // === NEW: Comprehensive NIST 800-90B-style Entropy Analysis ===
+
+  // Detect encoding type
+  const isHex = charAnalysis.hexadecimal;
+  const isBase64 = charAnalysis.base64;
+  const encoding: 'hex' | 'base64' | 'raw' = isHex ? 'hex' : (isBase64 ? 'base64' : 'raw');
+
+  // Convert all tokens to bits
+  const allBits: number[] = [];
+  for (const token of tokens) {
+    allBits.push(...tokenToBits(token, encoding));
+  }
+
+  const totalBits = allBits.length;
+
+  // Shannon entropy per bit
+  const bit0Count = allBits.filter(b => b === 0).length;
+  const bit1Count = allBits.filter(b => b === 1).length;
+  const p0 = bit0Count / totalBits;
+  const p1 = bit1Count / totalBits;
+  const shannonEntropyPerBit = p0 > 0 && p1 > 0 ? -(p0 * Math.log2(p0) + p1 * Math.log2(p1)) : 0;
+
+  // Min-entropy (global)
+  const minEntropy = calculateMinEntropy(tokens);
+  const avgBitsPerToken = totalBits / tokens.length;
+  const minEntropyPerBit = minEntropy / avgBitsPerToken;
+
+  // Per-position min-entropy
+  const perPositionResult = calculatePerPositionMinEntropy(tokens);
+  const perPositionMinEntropy = perPositionResult.totalEntropy;
+  const perPositionMinEntropyPerBit = perPositionMinEntropy / avgBitsPerToken;
+
+  // Effective security bits (worst case - use the minimum of all estimators)
+  const effectiveSecurityBits = Math.min(
+    minEntropy,
+    perPositionMinEntropy,
+    avgBitsPerToken * minEntropyPerBit
+  );
+
+  // Chi-squared test for uniformity
+  const chiSquaredPValue = chiSquaredTest(allBits);
+
+  // Serial correlation
+  const serialCorr = serialCorrelation(allBits);
+
+  // Runs test
+  const runsTestPValue = runsTest(allBits);
+
+  // LZ compression-based entropy estimate
+  const lzEntropy = lzEntropyEstimate(allBits);
+  const lzCompressionRatio = lzEntropy / shannonEntropyPerBit;
+  const estimatedEntropyRate = lzEntropy;
+
+  // Collision analysis
+  const collisionAnalysis = analyzeCollisions(tokens);
+
   // Security assessment
   const issues: string[] = [];
   const warnings: string[] = [];
   const strengths: string[] = [];
 
-  // Entropy checks
-  if (entropy < 3.0) issues.push(`Very low entropy (${entropy.toFixed(2)}). Tokens are highly predictable.`);
-  else if (entropy < 4.0) warnings.push(`Low entropy (${entropy.toFixed(2)}). Moderate predictability.`);
-  else if (entropy >= 4.5) strengths.push(`Good entropy (${entropy.toFixed(2)}). High randomness.`);
+  // === NEW: NIST-style Security Assessment based on Min-Entropy ===
+
+  const recommendedMinimum = 128; // NIST recommendation for session tokens
+
+  // Effective bits assessment (most critical)
+  if (effectiveSecurityBits < 64) {
+    issues.push(`CRITICAL: Effective security is only ${effectiveSecurityBits.toFixed(1)} bits (minimum 128 bits recommended). Tokens are easily guessable.`);
+  } else if (effectiveSecurityBits < 80) {
+    issues.push(`Effective security is ${effectiveSecurityBits.toFixed(1)} bits. Vulnerable to brute-force attacks (128+ bits recommended).`);
+  } else if (effectiveSecurityBits < 128) {
+    warnings.push(`Effective security is ${effectiveSecurityBits.toFixed(1)} bits. Below recommended 128 bits for session tokens.`);
+  } else {
+    strengths.push(`Strong effective security: ${effectiveSecurityBits.toFixed(1)} bits (exceeds 128-bit minimum).`);
+  }
+
+  // Min-entropy checks
+  if (minEntropyPerBit < 0.5) {
+    issues.push(`Very low min-entropy per bit (${minEntropyPerBit.toFixed(3)}). Tokens have predictable patterns.`);
+  } else if (minEntropyPerBit < 0.8) {
+    warnings.push(`Low min-entropy per bit (${minEntropyPerBit.toFixed(3)}). Some predictability present.`);
+  } else if (minEntropyPerBit > 0.95) {
+    strengths.push(`Excellent min-entropy per bit (${minEntropyPerBit.toFixed(3)}).`);
+  }
+
+  // Shannon entropy (kept for reference, but not primary)
+  if (entropy < 3.0) warnings.push(`Low Shannon entropy (${entropy.toFixed(2)}). May indicate limited character set.`);
+  else if (entropy >= 4.5) strengths.push(`Good Shannon entropy (${entropy.toFixed(2)}).`);
+
+  // Chi-squared uniformity test
+  if (chiSquaredPValue < 0.01) {
+    issues.push(`Chi-squared test failed (p=${chiSquaredPValue.toFixed(4)}). Bit distribution is non-uniform.`);
+  } else if (chiSquaredPValue < 0.05) {
+    warnings.push(`Chi-squared test marginal (p=${chiSquaredPValue.toFixed(4)}). Slight non-uniformity detected.`);
+  } else {
+    strengths.push(`Chi-squared test passed (p=${chiSquaredPValue.toFixed(4)}). Uniform bit distribution.`);
+  }
+
+  // Serial correlation test
+  const absCorr = Math.abs(serialCorr);
+  if (absCorr > 0.3) {
+    issues.push(`High serial correlation (${serialCorr.toFixed(3)}). Consecutive bits are dependent.`);
+  } else if (absCorr > 0.1) {
+    warnings.push(`Moderate serial correlation (${serialCorr.toFixed(3)}). Some bit dependencies present.`);
+  } else {
+    strengths.push(`Low serial correlation (${serialCorr.toFixed(3)}). Bits are independent.`);
+  }
+
+  // Runs test
+  if (runsTestPValue < 0.01) {
+    issues.push(`Runs test failed (p=${runsTestPValue.toFixed(4)}). Non-random run patterns detected.`);
+  } else if (runsTestPValue < 0.05) {
+    warnings.push(`Runs test marginal (p=${runsTestPValue.toFixed(4)}). Possible run pattern issues.`);
+  } else {
+    strengths.push(`Runs test passed (p=${runsTestPValue.toFixed(4)}). Random run distribution.`);
+  }
+
+  // LZ compression entropy
+  if (lzCompressionRatio > 1.2) {
+    issues.push(`High LZ compression ratio (${lzCompressionRatio.toFixed(2)}). Structure detected in data.`);
+  } else if (lzCompressionRatio > 1.05) {
+    warnings.push(`Elevated LZ compression ratio (${lzCompressionRatio.toFixed(2)}). Some structure present.`);
+  } else {
+    strengths.push(`Good LZ compression ratio (${lzCompressionRatio.toFixed(2)}). Minimal structure.`);
+  }
+
+  // Collision analysis
+  if (collisionAnalysis.nearDuplicates > tokens.length * 0.01) {
+    warnings.push(`${collisionAnalysis.nearDuplicates} near-duplicate tokens found (Hamming distance ≤ 2).`);
+  } else if (collisionAnalysis.nearDuplicates === 0) {
+    strengths.push(`No near-duplicate tokens (Hamming distance > 2).`);
+  }
 
   // Duplicate checks
-  if (duplicatePercentage > 10) issues.push(`${duplicatePercentage.toFixed(1)}% duplicate tokens. Poor randomness.`);
-  else if (duplicatePercentage > 5) warnings.push(`${duplicatePercentage.toFixed(1)}% duplicate tokens.`);
-  else if (duplicatePercentage < 2) strengths.push(`Very few duplicates (${duplicatePercentage.toFixed(1)}%).`);
+  if (duplicatePercentage > 10) issues.push(`${duplicatePercentage.toFixed(1)}% exact duplicate tokens. Poor randomness.`);
+  else if (duplicatePercentage > 5) warnings.push(`${duplicatePercentage.toFixed(1)}% exact duplicate tokens.`);
+  else if (duplicatePercentage < 2) strengths.push(`Very few exact duplicates (${duplicatePercentage.toFixed(1)}%).`);
 
   // Sequential checks
   if (sequential.isSequential) issues.push('Sequential pattern detected. Tokens are predictable.');
@@ -278,10 +697,6 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
 
   // Timestamp checks
   if (hasTimestamps) issues.push('Timestamp-based tokens detected. Highly predictable.');
-
-  // Bit entropy checks
-  if (bitAnalysis.bitEntropy < 0.9) warnings.push(`Low bit-level entropy (${bitAnalysis.bitEntropy.toFixed(3)}). Biased bit distribution.`);
-  else if (bitAnalysis.bitEntropy > 0.99) strengths.push(`Excellent bit-level entropy (${bitAnalysis.bitEntropy.toFixed(3)}).`);
 
   // Predictability checks
   if (predictabilityScore > 50) issues.push(`High predictability score (${predictabilityScore}/100).`);
@@ -319,11 +734,26 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
     },
     characterAnalysis: charAnalysis,
     bitAnalysis,
+    entropyAnalysis: {
+      shannonEntropyPerBit,
+      minEntropyPerBit,
+      perPositionMinEntropy: perPositionMinEntropyPerBit,
+      effectiveSecurityBits,
+      chiSquaredPValue,
+      serialCorrelation: serialCorr,
+      runsTestPValue,
+      lzCompressionRatio,
+      estimatedEntropyRate,
+      perPositionData: perPositionResult.positionData
+    },
+    collisionAnalysis,
     security: {
       overallRating,
       issues,
       warnings,
-      strengths
+      strengths,
+      effectiveBits: effectiveSecurityBits,
+      recommendedMinimum
     }
   };
 }
@@ -652,17 +1082,26 @@ export function init(sdk: SDK<API>) {
   sdk.api.register("exportCSV", () => {
     if (tokenCaptures.length === 0) return '';
 
-    const headers = ['Index', 'Token', 'Length', 'Extracted From'];
+    const headers = ['Index', 'Token', 'Length', 'Extracted From', 'Request Sent', 'Response Received'];
+
+    const escapeCSV = (value: string) => {
+      // Escape quotes and wrap in quotes if contains special chars
+      const escaped = value.replace(/"/g, '""');
+      return `"${escaped}"`;
+    };
+
     const rows = tokenCaptures.map((capture, index) => [
       index + 1,
       capture.token,
       capture.token.length,
-      capture.extractedFrom
+      capture.extractedFrom,
+      capture.requestSent,
+      capture.responseReceived
     ]);
 
     const csv = [
-      headers.join(','),
-      ...rows.map(row => row.map(cell => `"${cell}"`).join(','))
+      headers.map(h => escapeCSV(h)).join(','),
+      ...rows.map(row => row.map(cell => escapeCSV(String(cell))).join(','))
     ].join('\n');
 
     return csv;

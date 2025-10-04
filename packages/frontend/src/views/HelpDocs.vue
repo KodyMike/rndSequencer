@@ -10,10 +10,12 @@
         <template #title>Overview</template>
         <template #content>
           <p>
-            The Random Sequencer plugin helps security researchers analyze the randomness and predictability
-            of tokens, session IDs, CSRF tokens, or any parameter returned by a web application. It repeatedly
-            sends HTTP requests, captures tokens from responses, and performs statistical analysis to identify
-            security weaknesses.
+            <strong>NIST 800-90B compliant</strong> token randomness analyzer for security researchers. Analyzes session tokens,
+            CSRF tokens, API keys, and security-critical parameters using professional entropy analysis.
+          </p>
+          <p>
+            <strong>Key Difference from Other Tools:</strong> Uses <strong>min-entropy</strong> (worst-case guessability) instead of
+            just Shannon entropy (average case). Attackers exploit worst-case scenarios, not averages.
           </p>
         </template>
       </Card>
@@ -38,57 +40,178 @@
       </Card>
 
       <Card class="doc-card">
-        <template #title>Understanding the Analysis</template>
+        <template #title>Understanding Results</template>
         <template #content>
-          <h3>Summary Metrics</h3>
-          <ul>
-            <li><strong>Total Samples:</strong> Number of requests sent and tokens captured</li>
-            <li><strong>Unique Values:</strong> Number of distinct tokens received</li>
-            <li><strong>Duplicate Count & Percentage:</strong> How many tokens appeared more than once</li>
-            <li><strong>Entropy:</strong> Character-level randomness (explained below)</li>
-            <li><strong>Length Stats:</strong> Average, minimum, and maximum token lengths</li>
-          </ul>
-
-          <h3>What is Entropy?</h3>
           <p>
-            <strong>Shannon Entropy</strong> measures how unpredictable the <em>characters</em> are within your tokens.
-            It's calculated using the formula:
+            Results are presented in plain English with clear verdicts and actionable recommendations for non-experts.
           </p>
-          <div class="formula">
-            H = -Σ(p(x) × log₂(p(x)))
-          </div>
-          <p>where p(x) is the probability of each character appearing.</p>
 
-          <h4>Entropy Scale:</h4>
+          <h3>Main Results Display</h3>
           <ul>
-            <li><strong>&lt; 3.0:</strong> Very Low - Characters are highly predictable (e.g., "111111", "aaaaaa")</li>
-            <li><strong>3.0 - 4.0:</strong> Low - Limited character variety</li>
-            <li><strong>4.0 - 4.5:</strong> Moderate - Decent character distribution</li>
-            <li><strong>&gt; 4.5:</strong> High - Good character randomness (e.g., "a7f3B9E2c1D4")</li>
+            <li><strong>Security Verdict:</strong> Large, color-coded rating (CRITICAL, WARNING, GOOD, or EXCELLENT)</li>
+            <li><strong>Plain English Explanation:</strong> What the rating means in simple terms</li>
+            <li><strong>Key Problems Detected:</strong> Specific issues found in the tokens</li>
+            <li><strong>Security Impact:</strong> What attackers could do with these weaknesses</li>
+            <li><strong>How to Fix:</strong> Step-by-step recommendations to improve token security</li>
           </ul>
 
-          <h3>Important: Entropy vs Duplicates</h3>
-          <div class="warning-box">
-            <p><strong>High entropy does NOT mean the tokens are secure!</strong></p>
-            <p>
-              You can have high entropy (random-looking characters) but still have high duplicates.
-              This happens when:
-            </p>
-            <ul>
-              <li>The server generates random tokens BUT reuses them across requests</li>
-              <li>Tokens are cached or session-based</li>
-              <li>The 20% unique tokens are very random, but 80% are duplicates</li>
-            </ul>
-            <p>
-              <strong>Example:</strong> If you get tokens like <code>a7f3B9E2c1D4</code> repeated 500 times,
-              then <code>x2K9mL3pQ8v1</code> repeated 300 times, then <code>nR4tY7wZ2fG6</code> repeated 200 times (out of 1000 samples):
-            </p>
-            <ul>
-              <li>✅ High entropy (characters are random)</li>
-              <li>❌ High duplicates (only 3 unique tokens in 1000 requests)</li>
-              <li>❌ CRITICAL security issue (tokens are predictable/reused)</li>
-            </ul>
+          <h3>Character Position Entropy Chart</h3>
+          <p>
+            A visual bar chart shows entropy at each character position, making it easy to identify weak spots:
+          </p>
+          <ul>
+            <li><strong>🔴 Red bars:</strong> Low entropy - predictable characters at this position</li>
+            <li><strong>🟡 Yellow bars:</strong> Moderate entropy - could be improved</li>
+            <li><strong>🟢 Green bars:</strong> Good entropy - random at this position</li>
+          </ul>
+          <p>
+            <strong>Tooltip:</strong> Hover over any bar to see exact entropy value, most common character, and frequency.
+          </p>
+
+          <h3>Technical Details (Advanced)</h3>
+          <p>
+            Click "View Technical Details" button to access comprehensive NIST 800-90B metrics:
+          </p>
+          <ul>
+            <li>All entropy measurements (Shannon, Min-Entropy, Per-Position Min-Entropy)</li>
+            <li>Statistical randomness tests (Chi-Squared, Serial Correlation, Runs Test)</li>
+            <li>Collision analysis and Hamming distances</li>
+            <li>Pattern detection results</li>
+            <li>Bit-level and character distribution analysis</li>
+          </ul>
+        </template>
+      </Card>
+
+      <Card class="doc-card">
+        <template #title>NIST 800-90B Entropy Analysis</template>
+        <template #content>
+          <p>
+            This plugin implements <strong>NIST Special Publication 800-90B</strong> entropy estimation for cryptographic random number generation assessment.
+          </p>
+
+          <h3>Primary Metrics</h3>
+
+          <h4>1. Effective Security Bits (Primary Metric)</h4>
+          <div class="formula">
+            Effective bits = min(H_min, H_per_position, bits × H_min_per_bit)
           </div>
+          <p><strong>Interpretation:</strong> Actual cryptographic strength. Minimum: <strong>128 bits</strong> for secure systems.</p>
+          <ul>
+            <li><strong>&lt; 64 bits:</strong> 🔴 CRITICAL - Cryptographically broken, brute-forceable</li>
+            <li><strong>64-127 bits:</strong> 🟡 WARNING - Insufficient for modern cryptography</li>
+            <li><strong>≥ 128 bits:</strong> 🟢 GOOD/EXCELLENT - Meets NIST recommendations</li>
+          </ul>
+
+          <h4>2. Min-Entropy (Worst-Case Guessability)</h4>
+          <div class="formula">
+            H_min = -log₂(max(p(x)))
+          </div>
+          <p>
+            Where <code>max(p(x))</code> is the highest probability of any token value.
+            <strong>This is the primary security metric</strong> because attackers exploit the most common token.
+          </p>
+
+          <h4>3. Shannon Entropy (Average Randomness)</h4>
+          <div class="formula">
+            H_shannon = -Σ p(x) · log₂(p(x))
+          </div>
+          <p>
+            Measures average uncertainty. <strong>Informational only</strong> - not used for security rating.
+            Can be misleading when values are slightly biased.
+          </p>
+
+          <h4>4. Per-Position Min-Entropy</h4>
+          <p>
+            For fixed-length tokens, calculates min-entropy at each character position independently,
+            then sums them. Detects position-specific biases (e.g., first char always 'a').
+          </p>
+
+          <h3>Statistical Randomness Tests</h3>
+
+          <h4>Chi-Squared Test (Bit Uniformity)</h4>
+          <div class="formula">
+            χ² = Σ((O - E)² / E)
+          </div>
+          <p>Tests if 0s and 1s are uniformly distributed. <strong>Pass:</strong> p-value ≥ 0.05</p>
+
+          <h4>Serial Correlation (Bit Independence)</h4>
+          <div class="formula">
+            r = cov(X,Y) / (σ_X · σ_Y)
+          </div>
+          <p>Measures correlation between consecutive bits. <strong>Good:</strong> |r| ≤ 0.1</p>
+
+          <h4>Runs Test (Pattern Detection)</h4>
+          <p>Analyzes sequences of consecutive identical bits. <strong>Pass:</strong> p-value ≥ 0.05</p>
+
+          <h4>LZ Compression (Structure Detection)</h4>
+          <p>LZ78-style compression to detect patterns. <strong>Good:</strong> ratio &lt; 1.05</p>
+
+          <h3>Why Min-Entropy Over Shannon?</h3>
+          <div class="warning-box">
+            <p><strong>Shannon entropy can be misleading for security!</strong></p>
+            <p>
+              <strong>Example:</strong> 1000 tokens where one value appears 100 times (10%), others once each:
+            </p>
+            <ul>
+              <li><strong>Shannon entropy:</strong> ~9.5 bits (looks good!)</li>
+              <li><strong>Min-entropy:</strong> ~3.3 bits (reveals the weakness)</li>
+              <li><strong>Reality:</strong> Attacker has 10% chance guessing the common token</li>
+            </ul>
+            <p>
+              <strong>NIST Guidance:</strong> "Min-entropy shall be used... Shannon entropy is inappropriate for
+              security assessments as it represents average-case rather than worst-case."
+            </p>
+          </div>
+
+          <h3>Quick Reference Table</h3>
+          <table style="width: 100%; border-collapse: collapse; margin: 1rem 0;">
+            <thead>
+              <tr style="background: var(--surface-ground);">
+                <th style="border: 1px solid var(--surface-border); padding: 0.5rem;">Metric</th>
+                <th style="border: 1px solid var(--surface-border); padding: 0.5rem;">Good</th>
+                <th style="border: 1px solid var(--surface-border); padding: 0.5rem;">Warning</th>
+                <th style="border: 1px solid var(--surface-border); padding: 0.5rem;">Critical</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">Effective Security Bits</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">≥128</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">64-127</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">&lt;64</td>
+              </tr>
+              <tr>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">Duplicates</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">&lt;5%</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">5-10%</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">&gt;10%</td>
+              </tr>
+              <tr>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">Chi-Squared p-value</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">≥0.05</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">0.01-0.05</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">&lt;0.01</td>
+              </tr>
+              <tr>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">Serial Correlation</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">|r|≤0.1</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">0.1&lt;|r|≤0.3</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">|r|&gt;0.3</td>
+              </tr>
+              <tr>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">Runs Test p-value</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">≥0.05</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">0.01-0.05</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">&lt;0.01</td>
+              </tr>
+              <tr>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">LZ Compression</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">&lt;1.05</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">1.05-1.2</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">&gt;1.2</td>
+              </tr>
+            </tbody>
+          </table>
 
           <h3>Why 1000+ Samples?</h3>
           <div class="info-box">
@@ -173,11 +296,11 @@
         <template #title>How to Use</template>
         <template #content>
           <ol>
-            <li><strong>Paste HTTP Request:</strong> Copy a raw HTTP request from Caido or Burp Suite</li>
+            <li><strong>Paste HTTP Request:</strong> Copy a raw HTTP request from Caido</li>
             <li><strong>Specify Parameter Name:</strong> Enter the exact name of the token parameter (e.g., "csrf_token", "sessionId", "token")
               <div class="info-box">
                 <strong>Response Viewer Feature:</strong> If you leave the parameter name empty and click "Show Fields",
-                the plugin will send a test request and display the response in a Burp Suite-style viewer with two panels:
+                the plugin will send a test request and display the response in a dual-panel viewer:
                 <ul>
                   <li><strong>Response Headers:</strong> View all HTTP headers including Set-Cookie headers</li>
                   <li><strong>Response Body:</strong> View the full response body (JSON, HTML, etc.)</li>

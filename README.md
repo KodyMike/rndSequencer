@@ -1,20 +1,30 @@
 # Caido Random Sequencer
 
-A plugin for Caido that analyzes token randomness and predictability. This plugin helps security researchers assess the cryptographic strength of session tokens, CSRF tokens, and other security-critical parameters.
+A **NIST 800-90B compliant** token randomness analyzer for Caido. Assess cryptographic strength of session tokens, CSRF tokens, API keys, and security-critical parameters using professional entropy analysis.
 
 ## Features
 
 ### Token Analysis
 - Multi-source extraction from URLs, form data, JSON, cookies, and HTTP headers
-- Statistical analysis with entropy calculation and duplicate detection
+- **NIST 800-90B compliant entropy analysis** including:
+  - Shannon entropy (average randomness)
+  - Min-entropy (worst-case guessability)
+  - Per-position min-entropy analysis
+  - LZ compression-based entropy estimation
+- Statistical randomness tests:
+  - Chi-squared uniformity test
+  - Serial correlation (bit independence)
+  - Runs test (pattern detection)
+- Collision and Hamming distance analysis
 - Pattern detection for sequential numbers, timestamps, and common prefixes/suffixes
 - Predictability scoring based on multiple factors
 
 ### Security Assessment
 - Automated security rating (Critical, Warning, Good, Excellent)
+- **Effective security bits calculation** (primary security metric)
 - Character-level and bit-level entropy analysis
 - Duplicate percentage tracking
-- Security recommendations based on findings
+- Comprehensive security recommendations based on NIST guidance
 
 ### User Interface
 - Response viewer for inspecting raw HTTP responses
@@ -61,19 +71,32 @@ The plugin package will be at `dist/plugin_package.zip`.
 - Total Samples: Number of tokens collected
 - Unique Values: Count of distinct tokens
 - Duplicates: Percentage of repeated tokens (high = security issue)
-- Entropy: Character randomness score (higher = better)
+- Entropy: Shannon entropy character randomness score (higher = better)
+
+**NIST 800-90B Entropy Analysis:**
+- **Effective Security Bits**: Primary security metric (minimum: 128 bits for cryptographic use)
+- **Shannon Entropy/bit**: Average uncertainty per bit (0-1 scale)
+- **Min-Entropy/bit**: Worst-case guessability per bit (more conservative than Shannon)
+- **Per-Position Min-Entropy**: Sum of min-entropy calculated at each character position
+- **LZ Compression Ratio**: Detects compressible structure (< 1.05 is good)
+- **Chi-Squared Test**: Bit uniformity (p-value ≥ 0.05 passes)
+- **Serial Correlation**: Bit independence (|value| ≤ 0.1 is good)
+- **Runs Test**: Randomness patterns (p-value ≥ 0.05 passes)
+- **Collision Analysis**: Exact duplicates, near-duplicates, Hamming distance
 
 **Security Ratings:**
-- Critical: Serious issues detected, tokens are predictable or reused
-- Warning: Some concerns found, review recommended
-- Good: No major issues but could be improved
-- Excellent: Strong randomness with multiple positive indicators
+- **Critical**: Effective security < 64 bits, serious issues detected
+- **Warning**: Effective security 64-127 bits, some concerns found
+- **Good**: Effective security ≥ 128 bits, minor improvements possible
+- **Excellent**: Effective security ≥ 128 bits with all statistical tests passing
 
 **Common Issues:**
 - High duplicates: Tokens are reused across requests
 - Sequential patterns: Tokens increment predictably
 - Timestamp-based: Tokens based on current time
-- Low entropy: Limited character variety
+- Low min-entropy: One or more characters/positions are biased
+- Failed statistical tests: Non-random bit distributions or patterns
+- High LZ compression ratio: Tokens contain detectable structure
 
 ## Development
 
@@ -91,23 +114,58 @@ pnpm build         # Build for production
 
 ## Analysis Methodology
 
-### Entropy Calculation
-Shannon entropy formula:
+### NIST 800-90B Entropy Analysis
+This plugin implements entropy estimation based on NIST Special Publication 800-90B, which provides guidance for cryptographic random number generation.
+
+**Shannon Entropy:**
 ```
-H(X) = -Σ p(x) * log₂(p(x))
+H_shannon = -Σ p(x) * log₂(p(x))
 ```
-Where p(x) is the probability of character x.
+Measures average uncertainty. However, Shannon entropy can be misleading when values are slightly biased.
+
+**Min-Entropy (Primary Metric):**
+```
+H_min = -log₂(max(p(x)))
+```
+Measures worst-case guessability. This is the recommended metric for security assessment as it represents the attacker's best-case scenario.
+
+**Per-Position Min-Entropy:**
+For fixed-length tokens, calculates min-entropy at each character position independently, then sums them. This detects position-specific biases.
+
+**Effective Security Bits:**
+```
+Effective bits = min(H_min, H_per_position, bit_length × H_min_per_bit)
+```
+The final security metric represents the actual cryptographic strength in bits.
+
+### Statistical Tests
+
+**Chi-Squared Test (Bit Uniformity):**
+Tests if 0s and 1s are uniformly distributed in the bit representation. p-value ≥ 0.05 indicates uniform distribution.
+
+**Serial Correlation (Independence):**
+Measures correlation between consecutive bits. Values near 0 indicate independence. |correlation| > 0.1 suggests dependency.
+
+**Runs Test (Randomness):**
+Analyzes sequences of consecutive identical bits. p-value ≥ 0.05 indicates random patterns.
+
+**LZ Compression Ratio:**
+Uses LZ78-style compression to detect structure. Ratio > 1.05 indicates compressible (non-random) data.
 
 ### Security Thresholds
-- Entropy: < 3.0 (Critical), 3.0-4.0 (Low), 4.0-4.5 (Moderate), > 4.5 (High)
-- Duplicates: > 10% (Critical), 5-10% (Warning), < 5% (Good)
-- Predictability Score: > 50 (Critical), 20-50 (Warning), < 20 (Good)
+- **Effective Security Bits**: < 64 (Critical), 64-127 (Warning), ≥ 128 (Good/Excellent)
+- **Duplicates**: > 10% (Critical), 5-10% (Warning), < 5% (Good)
+- **Predictability Score**: > 50 (Critical), 20-50 (Warning), < 20 (Good)
+- **Statistical Tests**: p-value < 0.05 or |correlation| > 0.1 indicates failure
 
 ### Pattern Detection
 - Sequential: Detects incrementing numbers
 - Timestamps: Identifies Unix timestamps (10-13 digits)
 - Common prefix/suffix: Finds shared strings
 - Bit entropy: Analyzes binary representation randomness
+
+### Why Min-Entropy Over Shannon?
+Shannon entropy measures average case, but attackers exploit worst-case scenarios. If one token value appears slightly more often, Shannon entropy stays high while min-entropy correctly drops, revealing the vulnerability. NIST 800-90B recommends min-entropy for security assessments.
 
 ## License
 
