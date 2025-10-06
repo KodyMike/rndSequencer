@@ -59,6 +59,15 @@ interface AnalysisResult {
       entropy: number;
       mostCommonChar: string;
       frequency: number;
+      coverage?: number;
+    }>;
+    perPositionRawData?: Array<{
+      position: number;
+      entropy: number;
+      normalizedEntropy: number;
+      mostCommonChar: string;
+      frequency: number;
+      coverage: number;
     }>;
   };
   collisionAnalysis: {
@@ -74,9 +83,24 @@ interface AnalysisResult {
     effectiveBits: number;
     recommendedMinimum: number;
   };
+  statisticalTests?: {
+    basis: 'raw_string' | 'decoded_bytes';
+    alpha: number;
+    tests: Array<{
+      name: string;
+      applicableCount: number;
+      passCount: number;
+      passRate: number;
+      medianP: number;
+      notes?: string;
+      pValues?: (number | null)[];
+    }>;
+  };
 }
 
 let tokenCaptures: TokenCapture[] = [];
+let activeRunId: string | null = null;
+const cancelledRuns = new Set<string>();
 
 // ---- Robust decoding to bytes ----
 function hasTextEncoder(): boolean {
@@ -225,32 +249,64 @@ function calculateMinEntropy(tokens: string[]): number {
 }
 
 // Per-position min-entropy for fixed-length tokens
-function calculatePerPositionMinEntropyBytes(byteTokens: number[][]): { totalEntropy: number, positionData: Array<{ position: number, entropy: number, mostCommonChar: string, frequency: number }> } {
+function calculatePerPositionMinEntropyBytes(byteTokens: number[][]): { totalEntropy: number, positionData: Array<{ position: number, entropy: number, mostCommonChar: string, frequency: number, coverage?: number }> } {
   if (byteTokens.length === 0) return { totalEntropy: 0, positionData: [] };
-  const tokenLength = Math.min(...byteTokens.map(t => t.length));
-  if (tokenLength <= 0) return { totalEntropy: 0, positionData: [] };
+  const maxLen = Math.max(...byteTokens.map(t => t.length));
+  if (maxLen <= 0) return { totalEntropy: 0, positionData: [] };
   let totalMinEntropy = 0;
-  const positionData: Array<{ position: number, entropy: number, mostCommonChar: string, frequency: number }> = [];
+  const positionData: Array<{ position: number, entropy: number, mostCommonChar: string, frequency: number, coverage?: number }> = [];
 
-  for (let pos = 0; pos < tokenLength; pos++) {
+  for (let pos = 0; pos < maxLen; pos++) {
     const freq = new Map<number, number>();
+    let contributors = 0;
     for (const bytes of byteTokens) {
       const v = bytes[pos];
       if (v === undefined) continue;
+      contributors++;
       freq.set(v, (freq.get(v) || 0) + 1);
     }
+    if (contributors === 0) continue;
     let maxCount = 0;
     let mostCommonVal = 0;
     for (const [val, count] of freq) {
       if (count > maxCount) { maxCount = count; mostCommonVal = val; }
     }
-    const contributors = Array.from(freq.values()).reduce((a, b) => a + b, 0) || 1;
     const maxProb = maxCount / contributors;
     const posMinEntropy = -Math.log2(maxProb);
-    positionData.push({ position: pos, entropy: posMinEntropy, mostCommonChar: mostCommonVal.toString(16).padStart(2, '0'), frequency: maxProb });
+    positionData.push({ position: pos, entropy: posMinEntropy, mostCommonChar: mostCommonVal.toString(16).padStart(2, '0'), frequency: maxProb, coverage: contributors / byteTokens.length });
     totalMinEntropy += posMinEntropy;
   }
   return { totalEntropy: totalMinEntropy, positionData };
+}
+
+// Per-position min-entropy on raw token characters (no decoding)
+function calculatePerPositionCharEntropyRaw(tokens: string[]): Array<{ position: number, entropy: number, normalizedEntropy: number, mostCommonChar: string, frequency: number, coverage: number }> {
+  if (tokens.length === 0) return [];
+  const maxLen = Math.max(...tokens.map(t => t.length));
+  const results: Array<{ position: number, entropy: number, normalizedEntropy: number, mostCommonChar: string, frequency: number, coverage: number }> = [];
+  for (let pos = 0; pos < maxLen; pos++) {
+    const freq = new Map<string, number>();
+    let contributors = 0;
+    for (const tok of tokens) {
+      const ch = tok[pos];
+      if (ch === undefined) continue;
+      contributors++;
+      freq.set(ch, (freq.get(ch) || 0) + 1);
+    }
+    if (contributors === 0) continue;
+    let mostChar = '';
+    let maxCount = 0;
+    for (const [ch, c] of freq) {
+      if (c > maxCount) { maxCount = c; mostChar = ch; }
+    }
+    const maxProb = maxCount / contributors;
+    const entropy = -Math.log2(maxProb);
+    const alphabetSize = Math.max(1, freq.size);
+    const maxAchievable = Math.log2(Math.min(contributors, alphabetSize));
+    const normalizedEntropy = maxAchievable > 0 ? Math.min(1, Math.max(0, entropy / maxAchievable)) : 0;
+    results.push({ position: pos, entropy, normalizedEntropy, mostCommonChar: mostChar, frequency: maxProb, coverage: contributors / tokens.length });
+  }
+  return results;
 }
 
 // Chi-squared test for uniformity
@@ -382,6 +438,228 @@ function lzEntropyEstimate(bits: number[]): number {
 
   // Entropy rate = compressed bits / original bits
   return compressedLength / bits.length;
+}
+
+// ========== SP 800-22 (subset) helpers on raw-string basis ==========
+
+function charStringToBitsRaw(s: string): number[] {
+  const bits: number[] = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i) & 0xff; // 8-bit
+    for (let b = 7; b >= 0; b--) bits.push((c >> b) & 1);
+  }
+  return bits;
+}
+
+// SP 800-22 Frequency (Monobit)
+function sp22FrequencyMonobit(bits: number[]): { p: number, applicable: boolean } {
+  const n = bits.length;
+  if (n < 100) return { p: 1.0, applicable: false };
+  let s = 0;
+  for (let i = 0; i < n; i++) s += bits[i] === 1 ? 1 : -1;
+  const sObs = Math.abs(s) / Math.sqrt(n);
+  const p = erfc(sObs / Math.SQRT2);
+  return { p: Math.max(0, Math.min(1, p)), applicable: true };
+}
+
+// Regularized upper incomplete gamma Q(s, x) via series/continued fraction
+function gammaincUpperRegularized(s: number, x: number): number {
+  if (x <= 0) return 1;
+  if (x < s + 1) {
+    // Use series for P(s,x), then Q = 1 - P
+    let sum = 1 / s;
+    let term = sum;
+    for (let n = 1; n < 1000; n++) {
+      term *= x / (s + n);
+      sum += term;
+      if (term < sum * 1e-12) break;
+    }
+    const lnGammaS = lnGamma(s);
+    const P = sum * Math.exp(s * Math.log(x) - x - lnGammaS);
+    return 1 - Math.min(1, Math.max(0, P));
+  } else {
+    // Continued fraction for Q(s,x)
+    const lnGammaS = lnGamma(s);
+    let a0 = 1; let a1 = x - s + 1; let b0 = 0; let b1 = 1;
+    let fac = 1 / a1;
+    let g = b1 * fac;
+    let gold = 0;
+    for (let n = 1; n < 1000; n++) {
+      const an = n * (s - n);
+      a0 = (a1 + a0 * an) as number;
+      b0 = (b1 + b0 * an) as number;
+      const aNew = (x - s + 2 * n + 1) * a0 + an * a1;
+      const bNew = (x - s + 2 * n + 1) * b0 + an * b1;
+      a1 = aNew; b1 = bNew;
+      if (b1 !== 0) {
+        fac = 1 / b1;
+        g = a1 * fac;
+        if (Math.abs((g - gold) / g) < 1e-12) break;
+        gold = g;
+      }
+    }
+    const Q = Math.exp(s * Math.log(x) - x - lnGammaS) * g;
+    return Math.min(1, Math.max(0, Q));
+  }
+}
+
+// (removed approxGamma; use lnGamma directly)
+
+function lnGamma(z: number): number {
+  const p = [
+    676.5203681218851,
+    -1259.1392167224028,
+    771.32342877765313,
+    -176.61502916214059,
+    12.507343278686905,
+    -0.13857109526572012,
+    9.9843695780195716e-6,
+    1.5056327351493116e-7,
+  ];
+  if (z < 0.5) {
+    return Math.log(Math.PI) - Math.log(Math.sin(Math.PI * z)) - lnGamma(1 - z);
+  }
+  z -= 1;
+  let x = 0.99999999999980993;
+  for (let i = 0; i < p.length; i++) x += (p[i] as number) / (z + i + 1);
+  const t = z + p.length - 0.5;
+  return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
+}
+
+function chiSquareUpperTailPValue(chi2: number, df: number): number {
+  const s = df / 2;
+  const x = chi2 / 2;
+  return gammaincUpperRegularized(s, x);
+}
+
+// SP 800-22 Block Frequency test
+function sp22BlockFrequency(bits: number[], M: number = 128): { p: number, applicable: boolean, blocks: number } {
+  const n = bits.length;
+  const N = Math.floor(n / M);
+  if (N < 1) return { p: 1.0, applicable: false, blocks: 0 };
+  let chi2 = 0;
+  for (let i = 0; i < N; i++) {
+    let sum = 0;
+    for (let j = 0; j < M; j++) sum += (bits[i * M + j] ?? 0);
+    const pi = sum / M;
+    chi2 += 4 * M * Math.pow(pi - 0.5, 2);
+  }
+  const p = chiSquareUpperTailPValue(chi2, N);
+  return { p, applicable: true, blocks: N };
+}
+
+// Aggregate per-token p-values via median; report pass rate at alpha
+function aggregatePValues(pvalues: number[], alpha: number): { median: number, passRate: number } {
+  if (pvalues.length === 0) return { median: 1.0, passRate: 1.0 };
+  const sorted = [...pvalues].sort((a,b)=>a-b);
+  const median = sorted[Math.floor(sorted.length/2)] ?? 1.0;
+  const passRate = pvalues.filter(p => p >= alpha).length / pvalues.length;
+  return { median, passRate };
+}
+
+// SP 800-22 Serial test (m=2)
+function sp22SerialM2(bits: number[]): { p1: number, p2: number, applicable: boolean } {
+  const n = bits.length;
+  if (n < 1000) return { p1: 1.0, p2: 1.0, applicable: false };
+  function psi2(m: number): number {
+    if (m <= 0) return 0;
+    const k = 1 << m;
+    const counts: number[] = new Array<number>(k).fill(0);
+    // Build overlapping m-bit patterns with wrap-around
+    let pattern = 0;
+    for (let i = 0; i < m; i++) pattern = (pattern << 1) | (bits[i] || 0);
+    counts[pattern]!++;
+    for (let i = m; i < n + m - 1; i++) {
+      pattern = ((pattern << 1) & (k - 1)) | (bits[i % n] || 0);
+      counts[pattern]!++;
+    }
+    let sum = 0;
+    for (let i = 0; i < k; i++) sum += (counts[i]! * counts[i]!);
+    return (k * sum) / n - n;
+  }
+  const psim2 = psi2(2);
+  const psim1 = psi2(1);
+  const psim0 = psi2(0);
+  const delta1 = psim2 - psim1;
+  const delta2 = psim1 - psim0;
+  const df1 = 1 << (2 - 1); // 2^(m-1) = 2
+  const df2 = 1 << (2 - 2); // 2^(m-2) = 1
+  const p1 = chiSquareUpperTailPValue(delta1, df1);
+  const p2 = chiSquareUpperTailPValue(delta2, df2);
+  return { p1: Math.max(0, Math.min(1, p1)), p2: Math.max(0, Math.min(1, p2)), applicable: true };
+}
+
+// SP 800-22 Approximate Entropy (m=2)
+function sp22ApproxEntropy(bits: number[], m: number = 2): { p: number, applicable: boolean } {
+  const n = bits.length;
+  if (n < 10000) return { p: 1.0, applicable: false };
+  function phi(mm: number): number {
+    const k = 1 << mm;
+    const counts: number[] = new Array<number>(k).fill(0);
+    let pattern = 0;
+    for (let i = 0; i < mm; i++) pattern = (pattern << 1) | (bits[i] || 0);
+    counts[pattern]!++;
+    for (let i = mm; i < n + mm - 1; i++) {
+      pattern = ((pattern << 1) & (k - 1)) | (bits[i % n] || 0);
+      counts[pattern]!++;
+    }
+    let sum = 0;
+    for (let i = 0; i < k; i++) {
+      const p = (counts[i]! / n);
+      if (p > 0) sum += p * Math.log(p);
+    }
+    return sum;
+  }
+  const phi_m = phi(m);
+  const phi_m1 = phi(m + 1);
+  const apEn = phi_m - phi_m1;
+  const X = 2 * n * (Math.log(2) - apEn);
+  // df = 2^(m) - 1 but NIST uses s = 2^(m-1) in igamc(s, X/2) for p-value mapping
+  const s = 1 << (m - 1);
+  const p = gammaincUpperRegularized(s, X / 2);
+  return { p: Math.max(0, Math.min(1, p)), applicable: true };
+}
+
+// SP 800-22 Cumulative Sums (forward/backward)
+function sp22CumulativeSums(bits: number[]): { p: number, applicable: boolean } {
+  const n = bits.length;
+  if (n < 1000) return { p: 1.0, applicable: false };
+  const toSigns = (arr: number[]) => arr.map(b => (b === 1 ? 1 : -1));
+  const signs = toSigns(bits);
+  const zFor = (arr: number[]) => {
+    let s = 0;
+    let z = 0;
+    for (let i = 0; i < arr.length; i++) {
+      s += arr[i] || 0;
+      const a = Math.abs(s);
+      if (a > z) z = a;
+    }
+    return z;
+  };
+  const zf = zFor(signs);
+  const zb = zFor([...signs].reverse());
+  const calcP = (z: number): number => {
+    if (z === 0) return 1.0;
+    const sqrtN = Math.sqrt(n);
+    let sum1 = 0;
+    const start1 = Math.floor((-n / z + 1) / 4);
+    const end1 = Math.floor((n / z - 1) / 4);
+    for (let k = start1; k <= end1; k++) {
+      sum1 += normalCDF(((4 * k + 1) * z) / sqrtN) - normalCDF(((4 * k - 1) * z) / sqrtN);
+    }
+    let sum2 = 0;
+    const start2 = Math.floor((-n / z - 3) / 4);
+    const end2 = Math.floor((n / z - 1) / 4);
+    for (let k = start2; k <= end2; k++) {
+      sum2 += normalCDF(((4 * k + 3) * z) / sqrtN) - normalCDF(((4 * k + 1) * z) / sqrtN);
+    }
+    const p = 1 - sum1 + sum2;
+    return Math.max(0, Math.min(1, p));
+  };
+  const pf = calcP(zf);
+  const pb = calcP(zb);
+  const p = Math.min(pf, pb);
+  return { p, applicable: true };
 }
 
 // Hamming distance between two strings
@@ -545,7 +823,7 @@ function analyzeCharacters(tokens: string[]): { charset: string; alphabetic: num
 }
 
 // Comprehensive analysis
-function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
+function analyzeTokens(captures: TokenCapture[], detail: boolean = true): AnalysisResult {
   const tokens = captures.map(c => c.token).filter(t => t && t !== 'Not found' && !t.startsWith('Request failed') && !t.startsWith('Parse Error'));
   const failedCaptures = captures.filter(c => c.token.startsWith('Request failed') || c.token.startsWith('Parse Error'));
   const notFoundCaptures = captures.filter(c => c.token === 'Not found');
@@ -607,87 +885,119 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
   // Character analysis (for display only; byte-level tests drive results)
   const charAnalysis = analyzeCharacters(tokens);
 
-  // Decode all tokens to bytes and bits
-  const decoded = tokens.map(t => decodeTokenToBytes(t));
-  const byteTokens: number[][] = decoded.map(d => d.bytes);
-  // Build full bitstream across tokens (do not strip common prefixes)
-  const allBits: number[] = [];
-  for (const bytes of byteTokens) allBits.push(...bytesToBits(bytes));
+  // Decode all tokens to bytes and bits (only if Security Analysis is enabled)
+  let decoded: { bytes: number[]; encoding: string }[] = [];
+  let byteTokens: number[][] = [];
+  let allBits: number[] = [];
+  let bitAnalysis: any = { totalBits: 0, onesCount: 0, zerosCount: 0, bitEntropy: 0 };
 
-  // Bit analysis (byte-true)
-  const bitAnalysis = calculateBitEntropyFromBytes(byteTokens);
+  if (detail) {
+    decoded = tokens.map(t => decodeTokenToBytes(t));
+    byteTokens = decoded.map(d => d.bytes);
+    // Build full bitstream across tokens (do not strip common prefixes)
+    for (const bytes of byteTokens) allBits.push(...bytesToBits(bytes));
+    // Bit analysis (byte-true)
+    bitAnalysis = calculateBitEntropyFromBytes(byteTokens);
+  }
 
   const totalBits = allBits.length;
-  const avgBitsPerToken = totalBits / tokens.length;
+  const avgBitsPerToken = detail ? (totalBits / tokens.length) : 0;
 
-  // Shannon entropy per bit
-  const bit0Count = allBits.filter(b => b === 0).length;
-  const p0 = totalBits ? bit0Count / totalBits : 0;
-  const p1 = 1 - p0;
-  const shannonEntropyPerBit = p0 > 0 && p1 > 0 ? -(p0 * Math.log2(p0) + p1 * Math.log2(p1)) : 0;
+  // Security Analysis heavy computations - only when detail=true
+  let shannonEntropyPerBit = 0;
+  let minEntropyWholeToken = 0;
+  let perPositionResult: any = { totalEntropy: 0, positionData: [] };
+  let perPositionMinEntropy = 0;
+  let perPositionMinEntropyPerBit = 0;
 
-  // Whole-token min-entropy (only meaningful if duplicates exist)
-  const minEntropyWholeToken = calculateMinEntropy(tokens);
+  if (detail) {
+    // Shannon entropy per bit
+    const bit0Count = allBits.filter(b => b === 0).length;
+    const p0 = totalBits ? bit0Count / totalBits : 0;
+    const p1 = 1 - p0;
+    shannonEntropyPerBit = p0 > 0 && p1 > 0 ? -(p0 * Math.log2(p0) + p1 * Math.log2(p1)) : 0;
 
-  // Per-position min-entropy using bytes (now computed up to minimum common length)
-  const perPositionResult = calculatePerPositionMinEntropyBytes(byteTokens);
-  const perPositionMinEntropy = perPositionResult.totalEntropy;
-  const perPositionMinEntropyPerBit = avgBitsPerToken ? (perPositionResult.totalEntropy / avgBitsPerToken) : 0;
+    // Whole-token min-entropy (only meaningful if duplicates exist)
+    minEntropyWholeToken = calculateMinEntropy(tokens);
+
+    // Per-position min-entropy using bytes (now computed up to minimum common length)
+    perPositionResult = calculatePerPositionMinEntropyBytes(byteTokens);
+    perPositionMinEntropy = perPositionResult.totalEntropy;
+    perPositionMinEntropyPerBit = avgBitsPerToken ? (perPositionResult.totalEntropy / avgBitsPerToken) : 0;
+  }
   // Security assessment accumulators
   const issues: string[] = [];
   const warnings: string[] = [];
   const strengths: string[] = [];
 
-  // Bit-bias min-entropy per bit across all bits
-  const pMax = Math.max(p0, p1);
-  const minEntropyPerBit = pMax > 0 ? -Math.log2(pMax) : 0;
+  // Security Analysis metrics - only computed when detail=true
+  let minEntropyPerBit = 0;
+  let effectiveSecurityBits = 0;
+  let chiSquaredPValue = 1.0;
+  let serialCorr = 0;
+  let runsTestPValue = 1.0;
+  let lzCompressionRatio = 1.0;
+  let estimatedEntropyRate = 0;
+  let collisionAnalysis: any = { exactDuplicates: 0, nearDuplicates: 0, averageHammingDistance: 0 };
 
-  // Effective security bits: avoid sample-size cap when no duplicates
-  const estimators: number[] = [];
-  // Always include bit-bias estimator across all bits
-  estimators.push(minEntropyPerBit * avgBitsPerToken);
-  // Include per-position bytes estimator only if fixed-length
-  if (perPositionMinEntropy !== undefined) estimators.push(perPositionMinEntropy);
-  // Include whole-token min-entropy only if duplicates exist
-  if (duplicateCount > 0) estimators.push(minEntropyWholeToken);
-  const effectiveSecurityBits = Math.min(...estimators);
+  if (detail) {
+    // Bit-bias min-entropy per bit across all bits
+    const bit0Count = allBits.filter(b => b === 0).length;
+    const p0 = totalBits ? bit0Count / totalBits : 0;
+    const p1 = 1 - p0;
+    const pMax = Math.max(p0, p1);
+    minEntropyPerBit = pMax > 0 ? -Math.log2(pMax) : 0;
 
-  // Prepare per-token bit arrays for aggregated tests
-  const perTokenBits = byteTokens.map(b => bytesToBits(b)).filter(b => b.length >= 100);
-  // Chi-squared: aggregate per-token p-values (median), to avoid cross-token artifacts
-  const chiPs = perTokenBits.map(b => chiSquaredTest(b)).filter(p => !Number.isNaN(p));
-  const chiSquaredPValue: number = chiPs.length > 0 ? chiPs.sort((a,b)=>a-b)[Math.floor(chiPs.length/2)] : 1.0;
+    // Effective security bits: avoid sample-size cap when no duplicates
+    const estimators: number[] = [];
+    // Always include bit-bias estimator across all bits
+    estimators.push(minEntropyPerBit * avgBitsPerToken);
+    // Include per-position bytes estimator only if fixed-length
+    if (perPositionMinEntropy !== undefined) estimators.push(perPositionMinEntropy);
+    // Include whole-token min-entropy only if duplicates exist
+    if (duplicateCount > 0) estimators.push(minEntropyWholeToken);
+    effectiveSecurityBits = Math.min(...estimators);
 
-  // Serial correlation (per-token average over full tokens)
-  const serialCorr = serialCorrelationPerTokenAverage(byteTokens);
+    // Prepare per-token bit arrays for aggregated tests
+    const perTokenBits = byteTokens.map(b => bytesToBits(b)).filter(b => b.length >= 100);
+    // Chi-squared: aggregate per-token p-values (median), to avoid cross-token artifacts
+    const chiPs = perTokenBits.map(b => chiSquaredTest(b)).filter(p => !Number.isNaN(p));
+    const chiSorted = [...chiPs].sort((a,b)=>a-b);
+    chiSquaredPValue = chiSorted.length > 0 ? (chiSorted[Math.floor(chiSorted.length/2)] ?? 1.0) : 1.0;
 
-  // Runs test: compute per-token and aggregate to reduce long-stream bias
-  const runsResults = perTokenBits.map(b => runsTest(b));
-  const applicableRuns = runsResults.filter(r => r.applicable).map(r => r.p);
-  const runsTestPValue = applicableRuns.length > 0 ? applicableRuns.sort((a,b)=>a-b)[Math.floor(applicableRuns.length/2)] : 1.0;
+    // Serial correlation (per-token average over full tokens)
+    serialCorr = serialCorrelationPerTokenAverage(byteTokens);
 
-  // LZ compression-based entropy estimate
-  const lzEntropy = lzEntropyEstimate(allBits);
-  const lzCompressionRatio = shannonEntropyPerBit > 1e-9 ? (lzEntropy / shannonEntropyPerBit) : 1;
-  const estimatedEntropyRate = lzEntropy;
+    // Runs test: compute per-token and aggregate to reduce long-stream bias
+    const runsResults = perTokenBits.map(b => runsTest(b));
+    const applicableRuns = runsResults.filter(r => r.applicable).map(r => r.p);
+    const runsSorted = [...applicableRuns].sort((a,b)=>a-b);
+    runsTestPValue = runsSorted.length > 0 ? (runsSorted[Math.floor(runsSorted.length/2)] ?? 1.0) : 1.0;
 
-  // Collision analysis
-  const collisionAnalysis = analyzeCollisions(tokens);
+    // LZ compression-based entropy estimate
+    const lzEntropy = lzEntropyEstimate(allBits);
+    lzCompressionRatio = shannonEntropyPerBit > 1e-9 ? (lzEntropy / shannonEntropyPerBit) : 1;
+    estimatedEntropyRate = lzEntropy;
 
-  // === NEW: NIST-style Security Assessment based on Min-Entropy ===
+    // Collision analysis
+    collisionAnalysis = analyzeCollisions(tokens);
+  }
+
+  // === NIST-style Security Assessment based on Min-Entropy (only when Security Analysis is enabled) ===
 
   const recommendedMinimum = 128; // NIST recommendation for session tokens
 
-  // Effective bits assessment (most critical)
-  if (effectiveSecurityBits < 64) {
-    issues.push(`CRITICAL: Effective security is only ${effectiveSecurityBits.toFixed(1)} bits (minimum 128 bits recommended). Tokens are easily guessable.`);
-  } else if (effectiveSecurityBits < 80) {
-    issues.push(`Effective security is ${effectiveSecurityBits.toFixed(1)} bits. Vulnerable to brute-force attacks (128+ bits recommended).`);
-  } else if (effectiveSecurityBits < 128) {
-    warnings.push(`Effective security is ${effectiveSecurityBits.toFixed(1)} bits. Below recommended 128 bits for session tokens.`);
-  } else {
-    strengths.push(`Strong effective security: ${effectiveSecurityBits.toFixed(1)} bits (exceeds 128-bit minimum).`);
-  }
+  if (detail) {
+    // Effective bits assessment (most critical)
+    if (effectiveSecurityBits < 64) {
+      issues.push(`CRITICAL: Effective security is only ${effectiveSecurityBits.toFixed(1)} bits (minimum 128 bits recommended). Tokens are easily guessable.`);
+    } else if (effectiveSecurityBits < 80) {
+      issues.push(`Effective security is ${effectiveSecurityBits.toFixed(1)} bits. Vulnerable to brute-force attacks (128+ bits recommended).`);
+    } else if (effectiveSecurityBits < 128) {
+      warnings.push(`Effective security is ${effectiveSecurityBits.toFixed(1)} bits. Below recommended 128 bits for session tokens.`);
+    } else {
+      strengths.push(`Strong effective security: ${effectiveSecurityBits.toFixed(1)} bits (exceeds 128-bit minimum).`);
+    }
 
   // Min-entropy checks
   if (minEntropyPerBit < 0.5) {
@@ -761,21 +1071,108 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
   // Timestamp checks
   if (hasTimestamps) issues.push('Timestamp-based tokens detected. Highly predictable.');
 
-  // Predictability checks
-  if (predictabilityScore > 50) issues.push(`High predictability score (${predictabilityScore}/100).`);
-  else if (predictabilityScore > 20) warnings.push(`Moderate predictability score (${predictabilityScore}/100).`);
-  else strengths.push(`Low predictability score (${predictabilityScore}/100).`);
+    // Predictability checks
+    if (predictabilityScore > 50) issues.push(`High predictability score (${predictabilityScore}/100).`);
+    else if (predictabilityScore > 20) warnings.push(`Moderate predictability score (${predictabilityScore}/100).`);
+    else strengths.push(`Low predictability score (${predictabilityScore}/100).`);
+  }
 
   // Add partial failure warnings
   warnings.push(...partialFailures);
 
   // Overall rating: make CRITICAL depend on effective bits or strong failures
   let overallRating: 'CRITICAL' | 'WARNING' | 'GOOD' | 'EXCELLENT';
-  const severeTestFailure = (!insufficientBits && (Math.abs(serialCorr) > 0.5 || chiSquaredPValue < 0.001 || runsTestPValue < 0.001));
-  if (effectiveSecurityBits < 64 || (effectiveSecurityBits < 80 && severeTestFailure)) overallRating = 'CRITICAL';
-  else if (warnings.length > 0 || effectiveSecurityBits < 128 || severeTestFailure) overallRating = 'WARNING';
-  else if (strengths.length >= 3) overallRating = 'EXCELLENT';
-  else overallRating = 'GOOD';
+  if (detail) {
+    const insufficientBits = totalBits < 100;
+    const severeTestFailure = (!insufficientBits && (Math.abs(serialCorr) > 0.5 || chiSquaredPValue < 0.001 || runsTestPValue < 0.001));
+    if (effectiveSecurityBits < 64 || (effectiveSecurityBits < 80 && severeTestFailure)) overallRating = 'CRITICAL';
+    else if (warnings.length > 0 || effectiveSecurityBits < 128 || severeTestFailure) overallRating = 'WARNING';
+    else if (strengths.length >= 3) overallRating = 'EXCELLENT';
+    else overallRating = 'GOOD';
+  } else {
+    // When Security Analysis is disabled, provide a basic rating based on duplicates and patterns
+    if (duplicatePercentage > 10 || sequential.isSequential || hasTimestamps) overallRating = 'CRITICAL';
+    else if (duplicatePercentage > 5 || predictabilityScore > 20) overallRating = 'WARNING';
+    else overallRating = 'GOOD';
+  }
+
+  // === SP 800-22 (subset) on raw-string basis ===
+  const alpha = 0.01;
+  const rawBitsPerToken = tokens.map(t => charStringToBitsRaw(t));
+  const monobitAll = rawBitsPerToken.map(b => sp22FrequencyMonobit(b));
+  const runsAll = rawBitsPerToken.map(b => runsTest(b));
+  const blockAll = rawBitsPerToken.map(b => sp22BlockFrequency(b, 256));
+  const serialAll = rawBitsPerToken.map(b => sp22SerialM2(b));
+  const apenAll = rawBitsPerToken.map(b => sp22ApproxEntropy(b, 2));
+  const cusumAll = rawBitsPerToken.map(b => sp22CumulativeSums(b));
+
+  const freqApplicable = monobitAll.filter(r => r.applicable);
+  const runsApplicable = runsAll.filter(r => r.applicable);
+  const blockApplicable = blockAll.filter(r => r.applicable);
+  const serialApplicable = serialAll.filter(r => r.applicable);
+  const apenApplicable = apenAll.filter(r => r.applicable);
+  const cusumApplicable = cusumAll.filter(r => r.applicable);
+  const freqP = aggregatePValues(freqApplicable.map(r => r.p), alpha);
+  const runsP = aggregatePValues(runsApplicable.map(r => r.p), alpha);
+  const blockP = aggregatePValues(blockApplicable.map(r => r.p), alpha);
+  const serialP = aggregatePValues(serialApplicable.map(r => Math.min(r.p1, r.p2)), alpha);
+  const apenP = aggregatePValues(apenApplicable.map(r => r.p), alpha);
+  const cusumP = aggregatePValues(cusumApplicable.map(r => r.p), alpha);
+
+  const statisticalTests = {
+    basis: 'raw_string' as const,
+    alpha,
+    tests: [
+      {
+        name: 'Frequency (Monobit)',
+        applicableCount: freqApplicable.length,
+        passCount: Math.round(freqP.passRate * freqApplicable.length),
+        passRate: freqP.passRate,
+        medianP: freqP.median,
+        pValues: monobitAll.map(r => r.applicable ? r.p : null)
+      },
+      {
+        name: 'Runs',
+        applicableCount: runsApplicable.length,
+        passCount: Math.round(runsP.passRate * runsApplicable.length),
+        passRate: runsP.passRate,
+        medianP: runsP.median,
+        pValues: runsAll.map(r => r.applicable ? r.p : null)
+      },
+      {
+        name: 'Block Frequency (M=256)',
+        applicableCount: blockApplicable.length,
+        passCount: Math.round(blockP.passRate * blockApplicable.length),
+        passRate: blockP.passRate,
+        medianP: blockP.median,
+        pValues: blockAll.map(r => r.applicable ? r.p : null)
+      },
+      {
+        name: 'Serial (m=2)',
+        applicableCount: serialApplicable.length,
+        passCount: Math.round(serialP.passRate * serialApplicable.length),
+        passRate: serialP.passRate,
+        medianP: serialP.median,
+        pValues: serialAll.map(r => r.applicable ? Math.min(r.p1, r.p2) : null)
+      },
+      {
+        name: 'Approximate Entropy (m=2)',
+        applicableCount: apenApplicable.length,
+        passCount: Math.round(apenP.passRate * apenApplicable.length),
+        passRate: apenP.passRate,
+        medianP: apenP.median,
+        pValues: apenAll.map(r => r.applicable ? r.p : null)
+      },
+      {
+        name: 'Cumulative Sums (for/back)',
+        applicableCount: cusumApplicable.length,
+        passCount: Math.round(cusumP.passRate * cusumApplicable.length),
+        passRate: cusumP.passRate,
+        medianP: cusumP.median,
+        pValues: cusumAll.map(r => r.applicable ? r.p : null)
+      },
+    ],
+  };
 
   return {
     summary: {
@@ -808,7 +1205,8 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
       runsTestPValue,
       lzCompressionRatio,
       estimatedEntropyRate,
-      perPositionData: perPositionResult.positionData
+      perPositionData: detail ? perPositionResult.positionData : undefined,
+      perPositionRawData: calculatePerPositionCharEntropyRaw(tokens)
     },
     collisionAnalysis,
     security: {
@@ -818,7 +1216,8 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
       strengths,
       effectiveBits: effectiveSecurityBits,
       recommendedMinimum
-    }
+    },
+    statisticalTests
   };
 }
 
@@ -908,6 +1307,14 @@ interface RateLimitConfig {
   maxRetries: number;
   retryDelay: number;
   backoffMultiplier: number;
+  pauseOn429?: boolean;
+  respectRetryAfter?: boolean;
+  maxPauseMs?: number;
+  require2xx?: boolean;
+  non2xxPauseMs?: number;
+  allowedStatusCodes?: number[];
+  skipUntilAllowedStatus?: boolean;
+  requireTokenMatch?: boolean;
 }
 
 interface CollectionConfig {
@@ -915,15 +1322,17 @@ interface CollectionConfig {
   parameterName: string;
   count: number;
   rateLimit?: RateLimitConfig;
+  runId?: string;
 }
 
 export type API = DefineAPI<{
   test: () => string;
   startCollection: (config: CollectionConfig) => Promise<TokenCapture[]>;
   getTokens: () => TokenCapture[];
-  analyzeTokens: () => AnalysisResult;
+  analyzeTokens: (opts?: { securityAnalysis?: boolean }) => AnalysisResult;
   exportCSV: () => string;
   exportJSON: () => string;
+  cancelCollection: (runId?: string) => boolean;
 }>;
 
 export function init(sdk: SDK<API>) {
@@ -1004,6 +1413,8 @@ export function init(sdk: SDK<API>) {
       // The user is responsible for ensuring the host is reachable
       
       // Helper function to send a single request with retry logic
+      const thisRunId = config.runId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      activeRunId = thisRunId;
       const sendRequestWithRetry = async (requestNum: number): Promise<TokenCapture> => {
         const baseUrl = `${protocol}://${hostOnly}${port !== (protocol === 'https' ? 443 : 80) ? ':' + port : ''}`;
         const fullUrl = baseUrl + path;
@@ -1040,21 +1451,25 @@ export function init(sdk: SDK<API>) {
             const response = await sdkInstance.requests.send(spec);
             const statusCode = response.response.getCode();
 
-            // Check for rate limit response
-            if (statusCode === 429 && config.rateLimit?.enabled && config.rateLimit.retryOn429 && attempt < maxAttempts - 1) {
-              const retryAfterHeader = response.response.getHeader('Retry-After');
-              let waitTime = config.rateLimit.retryDelay * Math.pow(config.rateLimit.backoffMultiplier, attempt);
-
-              // If server provided Retry-After header, use it
-              if (retryAfterHeader) {
-                const retryAfterSeconds = parseInt(String(retryAfterHeader));
-                if (!isNaN(retryAfterSeconds)) {
-                  waitTime = retryAfterSeconds * 1000;
-                }
+            // Check for rate limit or disallowed status handling
+            if (statusCode === 429 && config.rateLimit?.enabled) {
+              const rl = config.rateLimit;
+              const skipOn429 = rl.skipUntilAllowedStatus ?? true;
+              if (skipOn429) {
+                // Signal outer loop to skip counting without delay
+                throw new Error(`SKIP_STATUS:429`);
               }
-
-              await new Promise(resolve => setTimeout(resolve, waitTime));
-              continue; // Retry
+            }
+            // Enforce allowed status codes (default: 2xx and 302)
+            const rl = config.rateLimit;
+            const allowed = rl?.allowedStatusCodes ?? (rl?.require2xx ?? true
+              ? [200,201,202,203,204,205,206,302]
+              : undefined);
+            const skipUntilAllowed = rl?.skipUntilAllowedStatus ?? true;
+            if (allowed && !allowed.includes(statusCode)) {
+              if (skipUntilAllowed) {
+                throw new Error(`SKIP_STATUS:${statusCode}`);
+              }
             }
 
             // Get response data
@@ -1064,8 +1479,16 @@ export function init(sdk: SDK<API>) {
             // Extract token
             const result = extractTokenFromResponse(responseBody, responseHeaders, config.parameterName);
 
+            // Enforce token presence if required (default off when no rateLimit provided)
+            const requireTokenMatch = config.rateLimit?.requireTokenMatch ?? false;
+            if (requireTokenMatch && (!result.token || result.token.length === 0)) {
+              // Skip counting and do not record
+              throw new Error('SKIP_NOTOKEN');
+            }
+
+            // Build capture only when token exists or matching not required
             return {
-              token: result.token || 'Not found',
+              token: result.token ?? 'Not found',
               requestSent: requestStr,
               responseReceived: responseBody.substring(0, 2000) + (responseBody.length > 2000 ? '...' : ''),
               extractedFrom: result.extractedFrom,
@@ -1083,53 +1506,75 @@ export function init(sdk: SDK<API>) {
           }
         }
 
-        // All retries failed
+        // All retries failed: return an error capture so callers can display feedback
         const errorMessage = lastError instanceof Error ? lastError.message : String(lastError);
         return {
-          token: `Request failed`,
+          token: 'Request failed',
           requestSent: requestStr,
           responseReceived: `Error: ${errorMessage}\nAttempted URL: ${baseUrl + path}\nMethod: ${method || 'GET'}\nRequest #${requestNum}`,
           extractedFrom: `Error: ${errorMessage}`
         };
       };
 
+      // Preflight: single request to ensure token can be extracted; if not, return early with the capture
+      const pre = await sendRequestWithRetry(1);
+      const tokenOk = pre.token && pre.token !== 'Not found' && !pre.token.startsWith('Request failed');
+      tokenCaptures.push(pre);
+      if (!tokenOk) {
+        if (activeRunId === thisRunId) activeRunId = null;
+        cancelledRuns.delete(thisRunId);
+        return tokenCaptures;
+      }
+
       // Collect tokens by sending real requests
       const rateLimit = config.rateLimit;
+      let collected = 1; // preflight already added
+      while (collected < config.count) {
+        if (cancelledRuns.has(thisRunId)) break;
+        try {
+          const capture = await sendRequestWithRetry(collected + 1);
+          tokenCaptures.push(capture);
+          collected++;
 
-      for (let i = 0; i < config.count; i++) {
-        // Send request
-        const capture = await sendRequestWithRetry(i + 1);
-        tokenCaptures.push(capture);
-
-        // Apply rate limiting if enabled
-        if (rateLimit?.enabled) {
-          // Check if we need a batch delay
-          const isLastInBatch = (i + 1) % rateLimit.requestsPerBatch === 0;
-          const isNotLastRequest = i < config.count - 1;
-
-          if (isLastInBatch && isNotLastRequest) {
-            // Delay between batches
-            await new Promise(resolve => setTimeout(resolve, rateLimit.delayBetweenBatches));
-          } else if (isNotLastRequest) {
-            // Small delay between requests in same batch (100ms default)
-            await new Promise(resolve => setTimeout(resolve, 100));
+          // Apply rate limiting if enabled
+          if (rateLimit?.enabled) {
+            const isLastInBatch = collected % rateLimit.requestsPerBatch === 0;
+            const isNotDone = collected < config.count;
+            if (isLastInBatch && isNotDone) {
+              const delay = rateLimit.delayBetweenBatches; const step = Math.max(50, Math.min(500, Math.floor(delay/10))); let waited=0;
+              while (waited < delay) { if (cancelledRuns.has(thisRunId)) break; await new Promise(r=>setTimeout(r,step)); waited+=step; }
+            } else if (isNotDone) {
+              const delay = 100; const step = 50; let waited=0;
+              while (waited < delay) { if (cancelledRuns.has(thisRunId)) break; await new Promise(r=>setTimeout(r,step)); waited+=step; }
+            }
+          } else {
+            if (collected < config.count) {
+              const delay = 100; const step = 50; let waited=0;
+              while (waited < delay) { if (cancelledRuns.has(thisRunId)) break; await new Promise(r=>setTimeout(r,step)); waited+=step; }
+            }
           }
-        } else {
-          // Default small delay when rate limiting is disabled
-          if (i < config.count - 1) {
-            await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (cancelledRuns.has(thisRunId)) break;
+          if (msg.startsWith('SKIP_STATUS:')) {
+            // Do not increment collected or record a capture; retry immediately (batch pacing still applies)
+            continue;
           }
+          if (msg === 'SKIP_NOTOKEN') {
+            // Do not count or record
+            continue;
+          }
+          if (msg.startsWith('SKIP_STATUS:')) {
+            continue;
+          }
+          // For any other unexpected error, do not count or record
+          continue;
         }
       }
+      if (activeRunId === thisRunId) activeRunId = null;
+      cancelledRuns.delete(thisRunId);
     } catch (error) {
-      // If parsing fails, add error
-      const capture: TokenCapture = {
-        token: `Parse Error: ${error}`,
-        requestSent: config.httpRequest,
-        responseReceived: `Failed to parse request: ${error}`,
-        extractedFrom: 'Parse Error'
-      };
-      tokenCaptures.push(capture);
+      // Parsing failed: do not record any capture to keep "collected" strictly token-bearing
     }
     
     return tokenCaptures;
@@ -1139,8 +1584,10 @@ export function init(sdk: SDK<API>) {
     return tokenCaptures;
   });
 
-  sdk.api.register("analyzeTokens", () => {
-    return analyzeTokens(tokenCaptures);
+  sdk.api.register("analyzeTokens", (_sdk, opts?: { securityAnalysis?: boolean, detail?: boolean }) => {
+    // Accept legacy 'detail' for compatibility, prefer 'securityAnalysis'
+    const security = !!(opts && (opts.securityAnalysis ?? opts.detail));
+    return analyzeTokens(tokenCaptures, security);
   });
 
   sdk.api.register("exportCSV", () => {
@@ -1172,11 +1619,18 @@ export function init(sdk: SDK<API>) {
   });
 
   sdk.api.register("exportJSON", () => {
-    const analysis = analyzeTokens(tokenCaptures);
+    const analysis = analyzeTokens(tokenCaptures, true);
     return JSON.stringify({
       timestamp: new Date().toISOString(),
       tokenCaptures,
       analysis
     }, null, 2);
+  });
+
+  sdk.api.register("cancelCollection", (_sdk, runId?: string) => {
+    const id = runId || activeRunId;
+    if (!id) return false;
+    cancelledRuns.add(id);
+    return true;
   });
 }

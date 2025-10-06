@@ -8,7 +8,7 @@ import Message from "primevue/message";
 import ProgressBar from "primevue/progressbar";
 import Dialog from "primevue/dialog";
 import Checkbox from "primevue/checkbox";
-import { ref, Directive, onMounted, nextTick } from "vue";
+import { ref, Directive, onMounted, nextTick, watch } from "vue";
 import { useSDK } from "../plugins/sdk";
 import HelpDocs from "./HelpDocs.vue";
 import { Chart, BarController, BarElement, CategoryScale, LinearScale, Title, Tooltip, Legend } from 'chart.js';
@@ -111,19 +111,30 @@ const message = ref("Ready");
 const tokenCount = ref(10);
 const captures = ref<TokenCapture[]>([]);
 const isCollecting = ref(false);
+const currentRunId = ref<string | null>(null);
 const httpRequest = ref("");
 const parameterName = ref("");
 const selectedCapture = ref<TokenCapture | null>(null);
 const analysis = ref<AnalysisResult | null>(null);
+const securityAnalysisComputed = ref(false); // Track if Security Analysis was actually computed
 const showTokensDialog = ref(false);
 const showTokenDetailsDialog = ref(false);
 const showHelp = ref(false);
 const showResponsePreview = ref(false);
 const showTechnicalDetailsDialog = ref(false);
+const showRandomnessDetailsDialog = ref(false);
 const previewResponse = ref<{body: string, headers: Record<string, string | string[]>} | null>(null);
 const extractableFields = ref<Array<{name: string, value: string, source: string}>>([]);
 const positionEntropyCanvas = ref<HTMLCanvasElement | null>(null);
 let positionEntropyChart: Chart | null = null;
+const rawPositionEntropyCanvas = ref<HTMLCanvasElement | null>(null);
+const rawPositionEntropyCanvasDialog = ref<HTMLCanvasElement | null>(null);
+let rawPositionEntropyChart: Chart | null = null;
+let rawPositionEntropyChartDialog: Chart | null = null;
+// Randomness Tests: charts per test
+const statCanvases: Record<number, HTMLCanvasElement | null> = {};
+const statCharts: Record<number, Chart | null> = {};
+const registerStatCanvas = (idx: number, el: HTMLCanvasElement | null) => { statCanvases[idx] = el; };
 
 // Rate limiting configuration
 const rateLimitEnabled = ref(false);
@@ -133,6 +144,17 @@ const retryOn429 = ref(true);
 const maxRetries = ref(3);
 const retryDelay = ref(1000);
 const backoffMultiplier = ref(2);
+const detailedAnalysis = ref(false);
+const cancelRun = async () => {
+  if (currentRunId.value) {
+    try {
+      await (sdk.backend as any).cancelCollection(currentRunId.value);
+      message.value = 'Cancelling…';
+    } catch (e: any) {
+      message.value = `Cancel failed: ${e?.message || String(e)}`;
+    }
+  }
+};
 
 const extractAllFields = (responseBody: string, headers: Record<string, string | string[]>) => {
   const fields: Array<{name: string, value: string, source: string}> = [];
@@ -276,21 +298,34 @@ const startCollection = async () => {
       } : undefined
     };
 
-    const result = await sdk.backend.startCollection(config);
+    const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    currentRunId.value = runId;
+    const result = await (sdk.backend as any).startCollection({ ...config, runId });
     captures.value = result;
     message.value = `Collected ${result.length} tokens`;
 
     // Automatically analyze after collection
-    const analysisResult = await sdk.backend.analyzeTokens();
-    analysis.value = analysisResult;
+    try {
+      securityAnalysisComputed.value = detailedAnalysis.value; // Remember if Security Analysis was enabled
+      const analysisResult = await (sdk.backend as any).analyzeTokens({ securityAnalysis: detailedAnalysis.value });
+      analysis.value = analysisResult;
+    } catch (e: any) {
+      message.value = `Analysis failed: ${e?.message || String(e)}`;
+    }
 
-    // Create position entropy chart if data is available
-    await createPositionEntropyChart();
+    // Create charts (best effort)
+    if (detailedAnalysis.value) {
+      try { await createPositionEntropyChart(); } catch {}
+    }
+    try { await createStatTestsCharts(); } catch {}
+    // Always create raw position chart if data exists (not gated by Security Analysis)
+    try { await createRawPositionEntropyChart(); } catch {}
   } catch (error) {
-    message.value = "Error during collection";
+    message.value = `Error during collection: ${error instanceof Error ? error.message : String(error)}`;
   }
 
   isCollecting.value = false;
+  currentRunId.value = null;
 };
 
 const selectParameter = (param: string) => {
@@ -364,6 +399,172 @@ const downloadJSON = async () => {
   } catch (error) {
     message.value = "Error exporting JSON";
   }
+};
+
+const createStatTestsCharts = async () => {
+  await nextTick();
+  const stat = (analysis.value as any)?.statisticalTests;
+  if (!stat || !stat.tests) return;
+  // Destroy existing
+  Object.values(statCharts).forEach(ch => { if (ch) ch.destroy(); });
+  for (let i = 0; i < stat.tests.length; i++) {
+    const t = stat.tests[i];
+    const el = statCanvases[i];
+    if (!el) continue;
+    const ctx = el.getContext('2d');
+    if (!ctx) continue;
+    // Build histogram (10 bins) from pValues (filter null)
+    const pvals = (t.pValues || []).filter((p: number | null) => typeof p === 'number') as number[];
+    const bins = new Array(10).fill(0);
+    pvals.forEach(p => {
+      const idx = Math.min(9, Math.max(0, Math.floor(p * 10)));
+      bins[idx]++;
+    });
+    const data = bins.map(c => (pvals.length ? Math.round((c / pvals.length) * 100) : 0));
+    const labels = ['0-0.1','0.1-0.2','0.2-0.3','0.3-0.4','0.4-0.5','0.5-0.6','0.6-0.7','0.7-0.8','0.8-0.9','0.9-1.0'];
+    statCharts[i] = new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: 'p-value distribution (%)', data, backgroundColor: 'rgba(99,102,241,0.7)', borderColor: 'rgba(99,102,241,1)', borderWidth: 1 }] },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { title: { display: true, text: `${t.name} (Applicable: ${t.applicableCount}, Pass: ${Math.round((t.passRate||0)*100)}%, Median p=${(t.medianP ?? 1).toFixed(3)})`, color: '#9ca3af', font: { size: 13, weight: 'bold' } }, legend: { display: false } },
+        scales: { y: { beginAtZero: true, max: 100, ticks: { color: '#9ca3af' }, grid: { color: 'rgba(156,163,175,0.1)' } }, x: { ticks: { color: '#9ca3af' }, grid: { color: 'rgba(156,163,175,0.1)' } } }
+      }
+    });
+  }
+};
+
+// Rebuild charts when opening the randomness dialog
+watch(showRandomnessDetailsDialog, async (val) => {
+  if (val) {
+    await createStatTestsCharts();
+    await createRawPositionEntropyChartDialog();
+  }
+});
+
+// Recreate Decoded Byte Position Analysis chart when Technical Details dialog opens
+watch(showTechnicalDetailsDialog, async (val) => {
+  if (val && securityAnalysisComputed.value) {
+    await createPositionEntropyChart();
+  }
+});
+
+// Randomness summary helpers
+const getPassRateColor = (ratePct: number, applicableCount: number) => {
+  if (applicableCount <= 0) return 'text-gray-400';
+  if (ratePct >= 95) return 'text-green-500';
+  if (ratePct >= 80) return 'text-yellow-500';
+  return 'text-red-500';
+};
+
+const getRandomnessVerdict = (stat: any) => {
+  if (!stat || !stat.tests || stat.tests.length === 0) return { label: 'Unknown', color: 'text-gray-400', note: 'Not enough data to assess.' };
+  // Core tests: Monobit, Runs, Block, Cusum
+  const names = stat.tests.map((t: any) => String(t.name).toLowerCase());
+  const coreIdx: number[] = [];
+  names.forEach((n: string, i: number) => {
+    if (n.includes('frequency (monobit)')) coreIdx.push(i);
+    else if (n === 'runs') coreIdx.push(i);
+    else if (n.includes('block frequency')) coreIdx.push(i);
+    else if (n.includes('cumulative sums')) coreIdx.push(i);
+  });
+  const core = coreIdx.map(i => stat.tests[i]).filter(Boolean);
+  const applicableCore = core.filter((t: any) => (t.applicableCount || 0) > 0);
+  if (applicableCore.length === 0) return { label: 'Neutral', color: 'text-gray-400', note: 'Tests not applicable; collect more samples.' };
+  const avgPass = applicableCore.reduce((a: number, t: any) => a + (t.passRate || 0), 0) / applicableCore.length;
+  if (avgPass >= 0.95) return { label: 'Good', color: 'text-green-500', note: 'Most core tests pass at ≥95%.' };
+  if (avgPass >= 0.80) return { label: 'Caution', color: 'text-yellow-500', note: 'Some tests are marginal; review detailed charts.' };
+  return { label: 'Poor', color: 'text-red-500', note: 'Core tests fail often; randomness appears weak.' };
+};
+
+const getRandomnessSuggestions = (stat: any) => {
+  const tips: string[] = [];
+  if (!stat || !stat.tests) return [
+    'Collect more samples (≥100) for stable results.',
+  ];
+  const verdict = getRandomnessVerdict(stat).label;
+  if (verdict === 'Poor') {
+    tips.push('Collect more samples (≥500) to reduce noise.');
+    tips.push('If tokens have structure (headers/payload), test the unpredictable substring.');
+    tips.push('Remove deterministic fields (timestamps/counters) from the token, or keep them signed separately.');
+  } else if (verdict === 'Caution') {
+    tips.push('Increase sample size (≥200) and re-test.');
+    tips.push('Verify consistent encoding (base64/base64url) and avoid mixed formats.');
+  } else if (verdict === 'Good') {
+    tips.push('Looks random; keep using a CSPRNG and avoid deterministic fields.');
+  } else {
+    tips.push('Collect more samples for a reliable summary.');
+  }
+  return tips;
+};
+
+const getWeakPositionsSummary = () => {
+  const perRaw = (analysis.value as any)?.entropyAnalysis?.perPositionRawData || [];
+  if (!perRaw || perRaw.length === 0) return [] as string[];
+  // Focus on positions with decent coverage
+  const filtered = perRaw.filter((d: any) => (d.coverage || 0) >= 0.6);
+  filtered.sort((a: any, b: any) => (a.normalizedEntropy - b.normalizedEntropy));
+  const worst = filtered.slice(0, 5);
+  return worst.map((d: any) => `Pos ${d.position}: '${d.mostCommonChar}' ${(d.frequency*100).toFixed(1)}%`);
+};
+
+// Per-test interpretation for the details table
+const interpretRandomnessTest = (t: any) => {
+  const applicable = t.applicableCount || 0;
+  const passPct = Math.round(((t.passRate || 0) * 100));
+  const med = t.medianP ?? 1;
+  const name = t.name || '';
+
+  if (applicable === 0) return 'Not enough data for this test; collect more samples.';
+
+  // Test-specific interpretations
+  const interpretations: Record<string, { good: string; marginal: string; bad: string }> = {
+    'Frequency (Monobit)': {
+      good: 'Equal distribution of 0s and 1s across all token bits - no global bit bias detected.',
+      marginal: 'Minor imbalance between 0s and 1s. Could indicate slight encoding bias or limited samples.',
+      bad: 'Significant imbalance between 0s and 1s. Suggests deterministic encoding, biased character set, or structured prefix/suffix.'
+    },
+    'Runs': {
+      good: 'Expected number of consecutive bit runs (e.g., "000" or "111"). No unusual clustering or alternating patterns.',
+      marginal: 'Slight deviation in run lengths. May indicate minor encoding artifacts or insufficient samples.',
+      bad: 'Abnormal run patterns detected. Tokens may contain repeating sequences, structured boundaries, or predictable transitions.'
+    },
+    'Block Frequency (M=256)': {
+      good: 'Uniform bit distribution within 256-bit blocks. No localized clustering or gaps in randomness.',
+      marginal: 'Some blocks show slight bias. Could be padding, encoding artifacts, or sample size effects.',
+      bad: 'Strong block-level bias detected. Indicates structured segments, repeating patterns, or non-uniform character usage within tokens.'
+    },
+    'Serial (m=2)': {
+      good: 'All 2-bit patterns (00, 01, 10, 11) appear with equal frequency. No sequential dependencies.',
+      marginal: 'Minor preference for certain bit pairs. May indicate encoding choice or limited charset overlap.',
+      bad: 'Strong preference for specific bit pairs. Suggests sequential patterns, base64/hex artifacts, or predictable state transitions.'
+    },
+    'Approximate Entropy (m=2)': {
+      good: 'High local entropy - neighboring bits show unpredictable variation. Consistent with cryptographic randomness.',
+      marginal: 'Moderate local entropy. Some short-range predictability present; consider longer tokens or larger samples.',
+      bad: 'Low local entropy detected. Adjacent bits are correlated or predictable. Common in counters, timestamps, or structured formats.'
+    },
+    'Cumulative Sums (for/back)': {
+      good: 'No cumulative drift in bit balance (forward or backward). Bits are well-distributed throughout token length.',
+      marginal: 'Slight cumulative drift. May indicate gradual bias or uneven token structure.',
+      bad: 'Significant cumulative drift. Tokens likely have biased prefixes, suffixes, or monotonic trends (e.g., incrementing values).'
+    }
+  };
+
+  const testInterp = interpretations[name];
+  if (!testInterp) {
+    // Fallback for unknown tests
+    if (passPct >= 95 && med >= 0.05) return 'Looks consistent with randomness for this test.';
+    if (passPct >= 80 && med >= 0.01) return 'Mostly ok; slight deviations present.';
+    if (med < 0.001 || passPct < 60) return 'Significant deviation; indicates non-random structure or bias.';
+    return 'Marginal; re-test with more samples to confirm.';
+  }
+
+  if (passPct >= 95 && med >= 0.05) return testInterp.good;
+  if (passPct >= 80 && med >= 0.01) return testInterp.marginal;
+  if (med < 0.001 || passPct < 60) return testInterp.bad;
+  return testInterp.marginal;
 };
 
 const getPlainEnglishVerdict = (analysis: any) => {
@@ -640,6 +841,74 @@ const createPositionEntropyChart = async () => {
     }
   });
 };
+
+const createRawPositionEntropyChart = async () => {
+  await nextTick();
+  const perRaw = (analysis.value as any)?.entropyAnalysis?.perPositionRawData;
+  if (!perRaw || perRaw.length === 0 || !rawPositionEntropyCanvas.value) return;
+  if (rawPositionEntropyChart) { rawPositionEntropyChart.destroy(); rawPositionEntropyChart = null; }
+  const ctx = rawPositionEntropyCanvas.value.getContext('2d');
+  if (!ctx) return;
+  createRawPositionChart(ctx, perRaw, (chart) => { rawPositionEntropyChart = chart; });
+};
+
+const createRawPositionEntropyChartDialog = async () => {
+  await nextTick();
+  const perRaw = (analysis.value as any)?.entropyAnalysis?.perPositionRawData;
+  if (!perRaw || perRaw.length === 0 || !rawPositionEntropyCanvasDialog.value) return;
+  if (rawPositionEntropyChartDialog) { rawPositionEntropyChartDialog.destroy(); rawPositionEntropyChartDialog = null; }
+  const ctx = rawPositionEntropyCanvasDialog.value.getContext('2d');
+  if (!ctx) return;
+  createRawPositionChart(ctx, perRaw, (chart) => { rawPositionEntropyChartDialog = chart; });
+};
+
+const createRawPositionChart = (ctx: CanvasRenderingContext2D, perRaw: any[], setChart: (chart: Chart) => void) => {
+  const chart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: perRaw.map((d: any) => `Pos ${d.position}`),
+      datasets: [{
+        label: 'Normalized Entropy',
+        data: perRaw.map((d: any) => d.normalizedEntropy * 8), // scale 0..8 like bytes
+        backgroundColor: perRaw.map((d: any) => {
+          const v = d.normalizedEntropy;
+          if (v < 0.5) return 'rgba(239,68,68,0.8)';
+          if (v < 0.75) return 'rgba(245,158,11,0.8)';
+          return 'rgba(34,197,94,0.8)';
+        }),
+        borderColor: perRaw.map((d: any) => {
+          const v = d.normalizedEntropy;
+          if (v < 0.5) return 'rgba(239,68,68,1)';
+          if (v < 0.75) return 'rgba(245,158,11,1)';
+          return 'rgba(34,197,94,1)';
+        }),
+        borderWidth: 1
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        title: { display: true, text: 'Per-Character Normalized Entropy (Raw String)', color: '#9ca3af', font: { size: 14, weight: 'bold' } },
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => {
+          const idx = ctx.dataIndex; const d = perRaw[idx];
+          return [
+            `Normalized Entropy: ${(d.normalizedEntropy*8).toFixed(2)} of 8`,
+            `Most common: '${d.mostCommonChar}'`,
+            `Frequency: ${(d.frequency*100).toFixed(1)}%`,
+            `Coverage: ${(d.coverage*100).toFixed(1)}%`
+          ];
+        }}}
+      },
+      scales: {
+        y: { beginAtZero: true, max: 8, ticks: { color: '#9ca3af' }, grid: { color: 'rgba(156,163,175,0.1)' } },
+        x: { ticks: { color: '#9ca3af', maxRotation: 45 }, grid: { color: 'rgba(156,163,175,0.1)' } }
+      }
+    }
+  });
+  setChart(chart);
+};
 </script>
 
 <template>
@@ -696,11 +965,21 @@ username=test&password=pass"
                 :disabled="isCollecting"
               />
             </div>
+            <div class="flex items-center gap-2 mb-2">
+              <Checkbox v-model="detailedAnalysis" :binary="true" inputId="detailedAnalysis" :disabled="isCollecting" />
+              <label for="detailedAnalysis" class="text-sm cursor-pointer" title="Computes Token Strength Analysis (entropy & structure); may be slower for large tokens.">Token Strength Analysis (slower)</label>
+            </div>
             <Button
               :label="parameterName.trim() ? 'Start Collection' : 'Show Fields'"
               @click="startCollection"
               :disabled="isCollecting || !httpRequest.trim()"
               :severity="parameterName.trim() ? 'success' : 'info'"
+            />
+            <Button
+              v-if="isCollecting"
+              label="Cancel"
+              severity="danger"
+              @click="cancelRun"
             />
           </div>
 
@@ -828,12 +1107,16 @@ username=test&password=pass"
       <template #title>
         <div class="flex justify-between items-center">
           <span>Collected Responses ({{ captures.length }})</span>
-          <Button
-            label="View All Responses"
-            @click="showTokensDialog = true"
-            size="small"
-            severity="info"
-          />
+          <div class="flex gap-2">
+            <Button label="Export CSV" @click="downloadCSV" size="small" severity="success" :disabled="captures.length === 0" />
+            <Button label="Export JSON" @click="downloadJSON" size="small" severity="success" :disabled="captures.length === 0" />
+            <Button
+              label="View All Responses"
+              @click="showTokensDialog = true"
+              size="small"
+              severity="info"
+            />
+          </div>
         </div>
       </template>
       <template #content>
@@ -847,6 +1130,161 @@ username=test&password=pass"
         </div>
       </template>
     </Card>
+
+    <!-- Randomness Summary + Token Position Analysis (side by side) -->
+    <div v-if="analysis && (analysis as any).statisticalTests" class="mb-4 space-y-4">
+      <Card>
+        <template #title>
+          <div class="flex justify-between items-center">
+            <span>Randomness Summary</span>
+            <div :class="getRandomnessVerdict((analysis as any).statisticalTests).color" class="text-sm font-semibold">
+              {{ getRandomnessVerdict((analysis as any).statisticalTests).label }}
+            </div>
+          </div>
+        </template>
+        <template #content>
+          <div class="text-xs text-gray-400 mb-2">
+            {{ getRandomnessVerdict((analysis as any).statisticalTests).note }}
+          </div>
+          <ul class="text-sm text-gray-300 list-disc list-inside">
+            <li v-for="(tip, i) in getRandomnessSuggestions((analysis as any).statisticalTests)" :key="i">{{ tip }}</li>
+          </ul>
+          <div v-if="getWeakPositionsSummary().length > 0" class="mt-2">
+            <div class="text-xs text-gray-400 mb-1">Weak character positions (raw string):</div>
+            <ul class="text-sm text-gray-300 list-disc list-inside">
+              <li v-for="(w, i) in getWeakPositionsSummary()" :key="'weak-'+i">{{ w }}</li>
+            </ul>
+          </div>
+          <div class="flex justify-end mt-3">
+            <Button label="View Randomness Details" size="small" severity="info" @click="showRandomnessDetailsDialog = true" />
+          </div>
+        </template>
+      </Card>
+
+      <Card v-if="(analysis as any)?.entropyAnalysis?.perPositionRawData && (analysis?.summary.totalSamples || 0) >= 50">
+        <template #title>
+          <div class="flex justify-between items-center">
+            <span>Token Position Analysis (Raw String)</span>
+          </div>
+        </template>
+        <template #content>
+          <div class="h-72">
+            <canvas ref="rawPositionEntropyCanvas"></canvas>
+          </div>
+          <div class="text-xs text-gray-400 mt-2">
+            Green = closer to uniformly random per position; Red = biased or repeated characters. Hover bars for most common char and frequency.
+          </div>
+        </template>
+      </Card>
+    </div>
+
+    <!-- (Removed duplicate Randomness Details trigger; available in summary card) -->
+
+    <!-- Randomness Details Dialog -->
+    <Dialog
+      v-model:visible="showRandomnessDetailsDialog"
+      header="Randomness Tests Details"
+      :style="{ width: '95vw', maxWidth: '1400px' }"
+      :modal="true"
+      :dismissableMask="true"
+      :pt="{ content: { style: { 'background-color': '#30333b' } } }"
+    >
+      <div v-if="analysis && (analysis as any).statisticalTests" class="space-y-4">
+        <!-- Summary and Explanation -->
+        <div class="p-3 rounded border border-[#616161]" style="background-color:#25272d;">
+          <h3 class="font-bold mb-2">What These Tests Mean</h3>
+          <p class="text-sm text-gray-300">
+            Randomness tests check whether the observed token strings look random. Results are shown per test as pass rates and p-value distributions.
+            Use this view to understand statistical behavior; use the Security Analysis (Entropy & Structure) view for cryptographic strength.
+          </p>
+          <ul class="text-sm text-gray-300 list-disc list-inside mt-2">
+            <li><strong>Applicable</strong>: number of tokens included in the test (skips when too few bits or preconditions fail)</li>
+            <li><strong>Pass</strong>: percent of applicable tokens with p ≥ α (default α={{ (analysis as any).statisticalTests.alpha }})</li>
+            <li><strong>Median p</strong>: median p-value across applicable tokens</li>
+          </ul>
+        </div>
+
+        <!-- Randomness Summary Badge and Core Overview -->
+        <div class="p-3 rounded border border-[#616161]" style="background-color:#25272d;">
+          <div class="flex justify-between items-center">
+            <div class="font-bold">Randomness Summary</div>
+            <div :class="getRandomnessVerdict((analysis as any).statisticalTests).color" class="text-sm font-semibold">
+              {{ getRandomnessVerdict((analysis as any).statisticalTests).label }}
+            </div>
+          </div>
+          <div class="text-xs text-gray-400 mt-1">
+            {{ getRandomnessVerdict((analysis as any).statisticalTests).note }}
+          </div>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">
+            <div v-for="t in (analysis as any).statisticalTests.tests" :key="t.name" class="p-2 rounded border border-[#616161]" style="background-color:#25272d;">
+              <div class="text-xs text-gray-400">{{ t.name }}</div>
+              <div :class="getPassRateColor(Math.round((t.passRate||0)*100), t.applicableCount)" class="text-lg font-bold">
+                {{ Math.round((t.passRate||0)*100) }}%
+              </div>
+              <div class="text-xs text-gray-500">Applicable: {{ t.applicableCount }}</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Summary Table with Dynamic Interpretation -->
+        <div class="p-3 rounded border border-[#616161]" style="background-color:#25272d;">
+          <div class="font-bold mb-2">Per-Test Summary</div>
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="text-gray-400 border-b border-[#616161]">
+                <th class="text-left p-1">Test</th>
+                <th class="text-right p-1">Applicable</th>
+                <th class="text-right p-1">Pass</th>
+                <th class="text-right p-1">Median p</th>
+                <th class="text-left p-1">Interpretation</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="t in (analysis as any).statisticalTests.tests" :key="'sum-'+t.name" class="border-t border-[#616161]">
+                <td class="p-1">{{ t.name }}</td>
+                <td class="p-1 text-right">{{ t.applicableCount }}</td>
+                <td class="p-1 text-right" :class="getPassRateColor(Math.round((t.passRate||0)*100), t.applicableCount)">{{ Math.round((t.passRate||0)*100) }}%</td>
+                <td class="p-1 text-right">{{ (t.medianP ?? 1).toFixed(3) }}</td>
+                <td class="p-1">{{ interpretRandomnessTest(t) }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="text-xs text-gray-400 mt-2">
+            Interpretation considers both pass rate and median p-value. Low pass rates and very small p-values often indicate deterministic structure or bias.
+          </div>
+        </div>
+
+        <!-- Per-Test Charts (single column for better readability) -->
+        <div class="space-y-4">
+          <!-- Token Position Analysis -->
+          <div class="p-3 rounded border border-[#616161]" style="background-color:#25272d;">
+            <div class="font-bold mb-2">Token Position Analysis (Raw String)</div>
+            <div class="text-sm text-gray-300 mb-3 p-2 rounded" style="background-color:#1e2025;">
+              <strong>What this shows:</strong> Character-level entropy at each position. Green means uniform (random-looking), red means biased or predictable characters.
+            </div>
+            <div class="h-48">
+              <canvas ref="rawPositionEntropyCanvasDialog"></canvas>
+            </div>
+            <div class="text-xs text-gray-400 mt-1">Hover bars for most common char and frequency at each position.</div>
+          </div>
+
+          <!-- Per-Test Charts -->
+          <div v-for="(t, idx) in (analysis as any).statisticalTests.tests" :key="t.name" class="p-3 rounded border border-[#616161]" style="background-color:#25272d;">
+            <div class="flex justify-between items-center mb-2">
+              <div class="font-bold">{{ t.name }}</div>
+              <div class="text-xs text-gray-400">Applicable: {{ t.applicableCount }} · Pass: {{ Math.round((t.passRate||0)*100) }}% · Median p: {{ (t.medianP ?? 1).toFixed(3) }}</div>
+            </div>
+            <!-- Dynamic Interpretation -->
+            <div class="text-sm text-gray-300 mb-3 p-2 rounded" style="background-color:#1e2025;">
+              <strong>Interpretation:</strong> {{ interpretRandomnessTest(t) }}
+            </div>
+            <div class="h-48">
+              <canvas :ref="(el:any) => registerStatCanvas(idx, el)"></canvas>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Dialog>
 
     <!-- Responses Dialog -->
     <Dialog
@@ -1018,7 +1456,7 @@ username=test&password=pass"
     <!-- Technical Details Dialog -->
     <Dialog
       v-model:visible="showTechnicalDetailsDialog"
-      header="Technical Analysis Details - NIST 800-90B Metrics"
+      header="Token Strength Analysis (Entropy & Structure)"
       :style="{ width: '90vw', maxWidth: '1200px' }"
       :modal="true"
       :dismissableMask="true"
@@ -1081,6 +1519,21 @@ username=test&password=pass"
                 {{ analysis.entropyAnalysis.lzCompressionRatio.toFixed(3) }}
               </div>
               <div class="text-xs text-gray-500 mt-1">Structure detection</div>
+            </div>
+          </div>
+
+          <!-- Decoded Byte Position Analysis (inside Technical Details only) -->
+          <div
+            v-if="securityAnalysisComputed && (analysis.summary.totalSamples || 0) >= 50 && (analysis.entropyAnalysis?.perPositionData?.length || 0) > 0"
+            class="mt-4 p-4 rounded border border-[#616161]"
+            style="background-color: #30333b;"
+          >
+            <div class="mb-2 font-bold">Decoded Byte Position Analysis</div>
+            <div class="h-64">
+              <canvas ref="positionEntropyCanvas"></canvas>
+            </div>
+            <div class="mt-2 text-xs text-gray-400">
+              Shows per-byte min-entropy across positions after decoding. Green = closer to uniformly random; Red = biased or repeated bytes.
             </div>
           </div>
 
@@ -1266,15 +1719,12 @@ username=test&password=pass"
       </div>
     </Dialog>
 
-    <!-- Analysis Results -->
-    <Card v-if="analysis" class="mb-4">
+    <!-- Token Strength Analysis Results -->
+    <Card v-if="securityAnalysisComputed && analysis" class="mb-4">
       <template #title>
         <div class="flex justify-between items-center">
-          <span>Security Analysis Results</span>
-          <div class="flex gap-2">
-            <Button label="Export CSV" @click="downloadCSV" size="small" severity="success" :disabled="analysis.summary.totalSamples === 0" />
-            <Button label="Export JSON" @click="downloadJSON" size="small" severity="success" :disabled="analysis.summary.totalSamples === 0" />
-          </div>
+          <span>Token Strength Analysis</span>
+          <div class="flex gap-2"></div>
         </div>
       </template>
       <template #content>
@@ -1373,15 +1823,7 @@ username=test&password=pass"
             </div>
           </div>
 
-          <!-- Character Position Entropy Chart -->
-          <div v-if="analysis.summary.totalSamples > 0 && analysis.entropyAnalysis?.perPositionData && analysis.entropyAnalysis.perPositionData.length > 0 && !analysis.security.issues[0]?.startsWith('REQUEST_FAILED:') && !analysis.security.issues[0]?.startsWith('PARAMETER_NOT_FOUND:')" class="p-4 rounded border border-[#616161]" style="background-color: #30333b;">
-            <div class="h-64">
-              <canvas ref="positionEntropyCanvas"></canvas>
-            </div>
-            <div class="mt-3 text-sm text-gray-400">
-              <p>🔴 Red bars show positions with low entropy (predictable characters). 🟡 Yellow bars indicate moderate entropy. 🟢 Green bars show good randomness.</p>
-            </div>
-          </div>
+          <!-- (Removed old Character Position Entropy Chart; replaced by Token Position Analysis above) -->
 
           <!-- Summary Statistics (only show if valid tokens were found and no errors) -->
           <div v-if="analysis.summary.totalSamples > 0 && !analysis.security.issues[0]?.startsWith('REQUEST_FAILED:') && !analysis.security.issues[0]?.startsWith('PARAMETER_NOT_FOUND:')">

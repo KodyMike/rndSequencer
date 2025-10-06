@@ -10,12 +10,22 @@
         <template #title>Overview</template>
         <template #content>
           <p>
-            <strong>NIST 800-90B compliant</strong> token randomness analyzer for security researchers. Analyzes session tokens,
-            CSRF tokens, API keys, and security-critical parameters using professional entropy analysis.
+            Professional token randomness analyzer for security researchers implementing <strong>NIST SP 800-90B</strong> (entropy estimation)
+            and <strong>NIST SP 800-22</strong> (statistical randomness testing). Analyzes session tokens, CSRF tokens, API keys,
+            and security-critical parameters using cryptographic-grade analysis.
           </p>
           <p>
+            <strong>Key Standards Implemented:</strong>
+          </p>
+          <ul>
+            <li><strong>NIST SP 800-22 (Statistical Test Suite):</strong> Frequency (Monobit), Runs, Block Frequency, Serial, Approximate Entropy, Cumulative Sums tests</li>
+            <li><strong>NIST SP 800-90B (Entropy Estimation):</strong> Min-entropy, Shannon entropy, per-position min-entropy, effective security bits</li>
+            <li><strong>Per-Token Analysis:</strong> Tests run individually per token and aggregated for statistical reliability</li>
+          </ul>
+          <p>
             <strong>Key Difference from Other Tools:</strong> Uses <strong>min-entropy</strong> (worst-case guessability) instead of
-            just Shannon entropy (average case). Attackers exploit worst-case scenarios, not averages.
+            just Shannon entropy (average case). Attackers exploit worst-case scenarios, not averages. Additionally, implements
+            full NIST SP 800-22 randomness test suite on raw token strings (8-bit per character).
           </p>
         </template>
       </Card>
@@ -24,17 +34,53 @@
         <template #title>How It Works</template>
         <template #content>
           <ol>
-            <li><strong>Request Repetition:</strong> The plugin sends the same HTTP request multiple times (default: 100)</li>
+            <li><strong>Configure Collection:</strong>
+              <ul>
+                <li>Paste HTTP request from Caido</li>
+                <li>Specify token parameter name (or use "Show Fields" to preview)</li>
+                <li>Set request count (default: 10, recommended: 1000+ for production)</li>
+                <li><strong>Optional:</strong> Enable "Token Strength Analysis (slower)" checkbox for cryptographic entropy analysis</li>
+                <li><strong>Optional:</strong> Configure rate limiting (requests/batch, delay, auto-retry)</li>
+              </ul>
+            </li>
+            <li><strong>Request Repetition:</strong> The plugin sends the same HTTP request multiple times to collect unique tokens</li>
             <li><strong>Token Extraction:</strong> For each response, it extracts the specified parameter from:
               <ul>
-                <li>JSON response bodies</li>
+                <li>JSON response bodies (nested keys supported)</li>
                 <li>Set-Cookie headers</li>
                 <li>URL-encoded responses</li>
                 <li>HTML input fields, meta tags, and data attributes</li>
                 <li>JavaScript variable assignments</li>
+                <li>Custom HTTP headers</li>
               </ul>
             </li>
-            <li><strong>Statistical Analysis:</strong> All captured tokens are analyzed for randomness and security</li>
+            <li><strong>Randomness Analysis (Always Computed):</strong>
+              <ul>
+                <li>NIST SP 800-22 statistical tests per token (Monobit, Runs, Block Frequency, Serial, Approximate Entropy, Cumulative Sums)</li>
+                <li>Token Position Analysis on raw string (character-level entropy per position)</li>
+                <li>Pass/fail rates and median p-values aggregated across all tokens</li>
+                <li>Randomness verdict: "Looks Random", "Mostly Random", or "Shows Patterns"</li>
+              </ul>
+            </li>
+            <li><strong>Token Strength Analysis (Only if Enabled):</strong>
+              <ul>
+                <li>Byte decoding (base64, base64url, hex detection)</li>
+                <li>Min-entropy, Shannon entropy, per-position min-entropy calculations</li>
+                <li>Effective security bits computation</li>
+                <li>Chi-squared uniformity test, serial correlation, runs test, LZ compression analysis</li>
+                <li>Collision and Hamming distance analysis</li>
+                <li>Security rating: CRITICAL, WARNING, GOOD, or EXCELLENT</li>
+                <li>Plain English verdict with "How to Fix" recommendations</li>
+              </ul>
+            </li>
+            <li><strong>Results Display:</strong>
+              <ul>
+                <li>Randomness Summary (always shown)</li>
+                <li>Token Position Analysis chart (always shown when ≥50 tokens)</li>
+                <li>Token Strength Analysis card (only if enabled before collection)</li>
+                <li>Export to CSV/JSON for sharing with development teams</li>
+              </ul>
+            </li>
           </ol>
         </template>
       </Card>
@@ -55,29 +101,219 @@
             <li><strong>How to Fix:</strong> Step-by-step recommendations to improve token security</li>
           </ul>
 
-          <h3>Character Position Entropy Chart</h3>
+          <h3>Randomness Summary</h3>
           <p>
-            A visual bar chart shows entropy at each character position, making it easy to identify weak spots:
+            Always displayed after token collection. Shows statistical randomness test results based on SP 800-22:
           </p>
           <ul>
-            <li><strong>🔴 Red bars:</strong> Low entropy - predictable characters at this position</li>
+            <li><strong>Overall Verdict:</strong> Looks Random, Mostly Random, or Shows Patterns</li>
+            <li><strong>Suggestions:</strong> Actionable tips based on test results</li>
+            <li><strong>Weak Positions:</strong> Character positions with biased or predictable values</li>
+            <li><strong>View Randomness Details:</strong> Opens dialog with per-test charts and interpretations</li>
+          </ul>
+
+          <h3>Token Position Analysis (Raw String)</h3>
+          <p>
+            Appears on main page when 50+ tokens collected. Shows character-level entropy at each position:
+          </p>
+          <ul>
+            <li><strong>🔴 Red bars:</strong> Low normalized entropy - predictable characters at this position</li>
             <li><strong>🟡 Yellow bars:</strong> Moderate entropy - could be improved</li>
-            <li><strong>🟢 Green bars:</strong> Good entropy - random at this position</li>
+            <li><strong>🟢 Green bars:</strong> High entropy - random at this position</li>
           </ul>
           <p>
-            <strong>Tooltip:</strong> Hover over any bar to see exact entropy value, most common character, and frequency.
+            <strong>Tooltip:</strong> Hover over any bar to see normalized entropy (0-8), most common character, frequency, and coverage.
           </p>
 
-          <h3>Technical Details (Advanced)</h3>
+          <h3>Token Strength Analysis (Optional)</h3>
           <p>
-            Click "View Technical Details" button to access comprehensive NIST 800-90B metrics:
+            Enable the <strong>"Token Strength Analysis (slower)"</strong> checkbox before collection to compute:
+          </p>
+          <ul>
+            <li><strong>Effective Security Bits:</strong> Cryptographic strength based on min-entropy</li>
+            <li><strong>Entropy Metrics:</strong> Shannon, min-entropy, per-position min-entropy</li>
+            <li><strong>Statistical Tests:</strong> Chi-squared, serial correlation, runs test, LZ compression</li>
+            <li><strong>Decoded Byte Analysis:</strong> Per-byte entropy after decoding (base64/hex)</li>
+            <li><strong>Security Rating:</strong> CRITICAL, WARNING, GOOD, or EXCELLENT</li>
+            <li><strong>Plain English Verdict:</strong> What attackers can do with these weaknesses</li>
+            <li><strong>How to Fix:</strong> Step-by-step recommendations</li>
+          </ul>
+          <p>
+            <strong>Performance:</strong> Heavy computations may take longer for large token counts (1000+).
+            Skip this if you only need randomness testing.
+          </p>
+
+          <h3>View Technical Details (Token Strength Analysis)</h3>
+          <p>
+            Only appears when Token Strength Analysis was enabled during collection. Shows:
           </p>
           <ul>
             <li>All entropy measurements (Shannon, Min-Entropy, Per-Position Min-Entropy)</li>
             <li>Statistical randomness tests (Chi-Squared, Serial Correlation, Runs Test)</li>
+            <li>Decoded Byte Position Analysis chart (base64/hex decoded entropy per byte)</li>
             <li>Collision analysis and Hamming distances</li>
             <li>Pattern detection results</li>
             <li>Bit-level and character distribution analysis</li>
+          </ul>
+        </template>
+      </Card>
+
+      <Card class="doc-card">
+        <template #title>NIST SP 800-22 Randomness Tests (Detailed)</template>
+        <template #content>
+          <p>
+            The Randomness Tests implement a subset of <strong>NIST Special Publication 800-22 Rev. 1a</strong>, the industry standard
+            for testing random number generators. Tests run on the <strong>raw token string</strong> (8-bit per character) to detect
+            non-random patterns, biases, and structure.
+          </p>
+          <p>
+            <strong>Methodology:</strong> Each test is computed <strong>per token individually</strong>, then results are aggregated:
+          </p>
+          <ul>
+            <li><strong>Applicable Count:</strong> Number of tokens that met test preconditions (e.g., minimum bit length)</li>
+            <li><strong>Pass Rate:</strong> Percentage of applicable tokens with p-value ≥ α (default α = 0.01)</li>
+            <li><strong>Median p-value:</strong> Median p-value across all applicable tokens</li>
+            <li><strong>Pass/Fail Threshold:</strong> p ≥ 0.01 = Pass (α = 0.01 significance level)</li>
+          </ul>
+
+          <h3>1. Frequency (Monobit) Test</h3>
+          <p><strong>Purpose:</strong> Detects global imbalance between 0s and 1s in the bit sequence.</p>
+          <div class="formula">
+            S_obs = |Σ(2×ε_i - 1)| / √n
+          </div>
+          <p>Where ε_i is the i-th bit, n is total bits. Under randomness, S_obs follows a standard normal distribution.</p>
+          <div class="formula">
+            p-value = erfc(S_obs / √2)
+          </div>
+          <p><strong>Interpretation:</strong></p>
+          <ul>
+            <li><strong>Pass (p ≥ 0.01):</strong> Equal distribution of 0s and 1s - no global bit bias</li>
+            <li><strong>Fail (p &lt; 0.01):</strong> Significant imbalance suggests deterministic encoding, biased charset, or structured prefix/suffix</li>
+          </ul>
+
+          <h3>2. Runs Test</h3>
+          <p><strong>Purpose:</strong> Checks if the number of runs (uninterrupted sequences of identical bits) is as expected for random data.</p>
+          <div class="formula">
+            V_obs = Σ r(k), where r(k) = 0 if ε_k = ε_(k+1), else 1
+          </div>
+          <p>Expected runs for random sequence: E[V] = 2nπ(1-π) + 1, where π = proportion of 1s.</p>
+          <div class="formula">
+            p-value = erfc(|V_obs - E[V]| / (2√2n × π(1-π)))
+          </div>
+          <p><strong>Interpretation:</strong></p>
+          <ul>
+            <li><strong>Pass:</strong> Expected number of runs - no unusual clustering or alternating patterns</li>
+            <li><strong>Fail:</strong> Too many/few runs indicates repeating sequences, structured boundaries, or predictable transitions</li>
+          </ul>
+
+          <h3>3. Block Frequency Test (M=256)</h3>
+          <p><strong>Purpose:</strong> Tests uniformity of 0s and 1s within fixed-size blocks (256 bits) to detect localized bias.</p>
+          <div class="formula">
+            χ² = 4M × Σ(π_i - 0.5)², where π_i = proportion of 1s in block i
+          </div>
+          <div class="formula">
+            p-value = igamc(N/2, χ²/2)
+          </div>
+          <p>Where N is number of blocks, igamc is the incomplete gamma function.</p>
+          <p><strong>Interpretation:</strong></p>
+          <ul>
+            <li><strong>Pass:</strong> Uniform bit distribution within blocks - no localized clustering</li>
+            <li><strong>Fail:</strong> Block-level bias indicates structured segments, padding, or non-uniform character usage</li>
+          </ul>
+
+          <h3>4. Serial Test (m=2)</h3>
+          <p><strong>Purpose:</strong> Tests whether all m-bit overlapping patterns appear with equal frequency (m=2 checks 00, 01, 10, 11).</p>
+          <div class="formula">
+            ψ²_m = (2^m / n) × Σ v_i² - n
+          </div>
+          <p>Where v_i is the count of each m-bit pattern.</p>
+          <div class="formula">
+            Δψ²_m = ψ²_m - ψ²_(m-1)
+          </div>
+          <div class="formula">
+            p-value = igamc(2^(m-2), Δψ²_m / 2)
+          </div>
+          <p><strong>Interpretation:</strong></p>
+          <ul>
+            <li><strong>Pass:</strong> All 2-bit patterns appear equally - no sequential dependencies</li>
+            <li><strong>Fail:</strong> Preference for certain bit pairs suggests sequential patterns, encoding artifacts (base64/hex), or state correlations</li>
+          </ul>
+
+          <h3>5. Approximate Entropy Test (m=2)</h3>
+          <p><strong>Purpose:</strong> Measures local randomness by comparing frequencies of overlapping m-bit and (m+1)-bit patterns.</p>
+          <div class="formula">
+            ApEn(m) = Φ(m) - Φ(m+1)
+          </div>
+          <div class="formula">
+            Φ(m) = Σ (C_i^m / n) × log(C_i^m / n)
+          </div>
+          <p>Where C_i^m is the count of m-bit pattern i.</p>
+          <div class="formula">
+            χ² = 2n × (log(2) - ApEn(m))
+          </div>
+          <div class="formula">
+            p-value = igamc(2^(m-1), χ²/2)
+          </div>
+          <p><strong>Interpretation:</strong></p>
+          <ul>
+            <li><strong>Pass:</strong> High local entropy - neighboring bits show unpredictable variation</li>
+            <li><strong>Fail:</strong> Low local entropy - adjacent bits are correlated (common in counters, timestamps, structured formats)</li>
+          </ul>
+
+          <h3>6. Cumulative Sums Test (Forward & Backward)</h3>
+          <p><strong>Purpose:</strong> Detects cumulative deviation from expected 50/50 bit balance, testing both forward and backward directions.</p>
+          <div class="formula">
+            S_k = Σ(i=1 to k) X_i, where X_i = 2ε_i - 1
+          </div>
+          <p>Compute maximum cumulative sum: z = max(|S_k|) for k ∈ [1, n]</p>
+          <div class="formula">
+            p-value = Σ(k=⌊-nz+1⌋ to ⌊nz-1⌋) [Φ((4k+1)z/√n) - Φ((4k-1)z/√n)]
+          </div>
+          <p>Where Φ is the standard normal CDF. Test runs both forward and backward; minimum p-value is reported.</p>
+          <p><strong>Interpretation:</strong></p>
+          <ul>
+            <li><strong>Pass:</strong> No cumulative drift - bits are well-distributed throughout token length</li>
+            <li><strong>Fail:</strong> Cumulative drift indicates biased prefixes/suffixes or monotonic trends (e.g., incrementing values)</li>
+          </ul>
+
+          <h3>Understanding Pass Rates</h3>
+          <table style="width: 100%; border-collapse: collapse; margin: 1rem 0;">
+            <thead>
+              <tr style="background: var(--surface-ground);">
+                <th style="border: 1px solid var(--surface-border); padding: 0.5rem;">Pass Rate</th>
+                <th style="border: 1px solid var(--surface-border); padding: 0.5rem;">Median p-value</th>
+                <th style="border: 1px solid var(--surface-border); padding: 0.5rem;">Verdict</th>
+                <th style="border: 1px solid var(--surface-border); padding: 0.5rem;">Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">≥95%</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">≥0.05</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">🟢 Pass</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">Consistent with random data</td>
+              </tr>
+              <tr>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">80-95%</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">0.01-0.05</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">🟡 Marginal</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">Slight deviations; retest with more samples</td>
+              </tr>
+              <tr>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">&lt;80%</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">&lt;0.01</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">🔴 Fail</td>
+                <td style="border: 1px solid var(--surface-border); padding: 0.5rem;">Significant non-random structure detected</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>Best Practices</h3>
+          <ul>
+            <li><strong>Sample Size:</strong> Use 100-500+ tokens for reliable statistical results. Small samples (&lt;50) may give false positives/negatives.</li>
+            <li><strong>Token Length:</strong> Tests require minimum bits. Very short tokens (&lt;100 bits) will show as "Not Applicable".</li>
+            <li><strong>Interpretation:</strong> A single test failure may not be critical; look for patterns across multiple tests.</li>
+            <li><strong>View Randomness Details:</strong> Click to see per-test p-value histograms and detailed interpretations.</li>
           </ul>
         </template>
       </Card>
