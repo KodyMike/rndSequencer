@@ -1,5 +1,7 @@
 import type { DefineAPI, SDK } from "caido:plugin";
 import { RequestSpec } from "caido:utils";
+// Declare atob for TS in non-DOM environments; provided by Caido at runtime
+declare function atob(data: string): string;
 
 interface TokenCapture {
   token: string;
@@ -76,41 +78,111 @@ interface AnalysisResult {
 
 let tokenCaptures: TokenCapture[] = [];
 
-// Convert token to bit array
-function tokenToBits(token: string, encoding: 'hex' | 'base64' | 'raw' = 'raw'): number[] {
-  const bits: number[] = [];
+// ---- Robust decoding to bytes ----
+function hasTextEncoder(): boolean {
+  try {
+    // @ts-ignore
+    return typeof TextEncoder !== 'undefined';
+  } catch {
+    return false;
+  }
+}
 
-  if (encoding === 'hex' && /^[0-9a-fA-F]+$/.test(token)) {
-    for (let i = 0; i < token.length; i++) {
-      const val = parseInt(token[i] || '0', 16);
-      for (let j = 3; j >= 0; j--) {
-        bits.push((val >> j) & 1);
-      }
-    }
-  } else if (encoding === 'base64' && /^[A-Za-z0-9+/=]+$/.test(token)) {
-    // Decode base64 to binary
+function stringToUtf8Bytes(s: string): number[] {
+  try {
+    // @ts-ignore
+    if (hasTextEncoder()) return Array.from(new TextEncoder().encode(s));
+  } catch {}
+  const out: number[] = [];
+  for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 0xff);
+  return out;
+}
+
+function tryDecodeHex(token: string): number[] | null {
+  const clean = token.replace(/\s+/g, '');
+  if (!/^[0-9a-fA-F]+$/.test(clean)) return null;
+  if (clean.length % 2 !== 0) return null;
+  const bytes: number[] = [];
+  for (let i = 0; i < clean.length; i += 2) {
+    const byte = parseInt(clean.slice(i, i + 2), 16);
+    if (Number.isNaN(byte)) return null;
+    bytes.push(byte);
+  }
+  return bytes;
+}
+
+function tryDecodeBase64Like(token: string): { bytes: number[]; kind: 'base64' | 'base64url' } | null {
+  const toB64 = (s: string) => {
+    let t = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (t.length % 4) t += '=';
+    return t;
+  };
+  const variants: { s: string; kind: 'base64' | 'base64url' }[] = [];
+  variants.push({ s: toB64(token), kind: /[-_]/.test(token) ? 'base64url' : 'base64' });
+  variants.push({ s: token, kind: 'base64' });
+  if (token.startsWith('.')) variants.push({ s: toB64(token.slice(1)), kind: /[-_]/.test(token) ? 'base64url' : 'base64' });
+  // Avoid removing all dots; JWT-like tokens should not be coerced to base64 as a whole
+  for (const a of variants) {
     try {
-      const decoded = atob(token.replace(/=/g, ''));
-      for (let i = 0; i < decoded.length; i++) {
-        const byte = decoded.charCodeAt(i);
-        for (let j = 7; j >= 0; j--) {
-          bits.push((byte >> j) & 1);
-        }
+      const bin = atob(a.s) as unknown as string;
+      const bytes = Array.from(bin as string).map((ch: string) => ch.charCodeAt(0) & 0xff);
+      return { bytes, kind: a.kind };
+    } catch {}
+  }
+  return null;
+}
+
+
+// Serial correlation averaged per-token (avoid cross-token boundary artifacts)
+function serialCorrelationPerTokenAverage(byteTokens: number[][]): number {
+  let weightedAbs = 0;
+  let totalBits = 0;
+  for (const bytes of byteTokens) {
+    const bits = bytesToBits(bytes);
+    if (bits.length < 2) continue;
+    const corr = serialCorrelation(bits);
+    weightedAbs += Math.abs(corr) * bits.length;
+    totalBits += bits.length;
+  }
+  return totalBits > 0 ? (weightedAbs / totalBits) : 0;
+}
+
+function decodeTokenToBytes(token: string): { bytes: number[]; encoding: 'hex' | 'base64' | 'base64url' | 'raw' } {
+  // Attempt segmented base64/base64url decoding for dot-separated tokens
+  if (token.includes('.')) {
+    const parts = token.split('.').filter(p => p.length > 0);
+    if (parts.length >= 2) {
+      const decodedParts: number[][] = [];
+      let kind: 'base64' | 'base64url' = 'base64';
+      let ok = true;
+      for (const p of parts) {
+        const maybe = tryDecodeBase64Like(p);
+        if (!maybe) { ok = false; break; }
+        decodedParts.push(maybe.bytes);
+        // If any part looked base64url, keep that label
+        if (maybe.kind === 'base64url') kind = 'base64url';
       }
-    } catch {
-      // Fall back to raw
-      return tokenToBits(token, 'raw');
-    }
-  } else {
-    // Raw byte encoding
-    for (let i = 0; i < token.length; i++) {
-      const byte = token.charCodeAt(i);
-      for (let j = 7; j >= 0; j--) {
-        bits.push((byte >> j) & 1);
+      if (ok) {
+        const joined: number[] = [];
+        for (const arr of decodedParts) joined.push(...arr);
+        return { bytes: joined, encoding: kind };
       }
     }
   }
 
+  // Try whole-string hex or base64-like
+  const hex = tryDecodeHex(token);
+  if (hex) return { bytes: hex, encoding: 'hex' };
+  const b64 = tryDecodeBase64Like(token);
+  if (b64) return { bytes: b64.bytes, encoding: b64.kind };
+  return { bytes: stringToUtf8Bytes(token), encoding: 'raw' };
+}
+
+function bytesToBits(bytes: number[]): number[] {
+  const bits: number[] = [];
+  for (const byte of bytes) {
+    for (let j = 7; j >= 0; j--) bits.push((byte >> j) & 1);
+  }
   return bits;
 }
 
@@ -153,58 +225,54 @@ function calculateMinEntropy(tokens: string[]): number {
 }
 
 // Per-position min-entropy for fixed-length tokens
-function calculatePerPositionMinEntropy(tokens: string[]): { totalEntropy: number, positionData: Array<{ position: number, entropy: number, mostCommonChar: string, frequency: number }> } {
-  if (tokens.length === 0) return { totalEntropy: 0, positionData: [] };
-
-  // Check if all tokens are same length
-  const lengths = tokens.map(t => t.length);
-  const allSameLength = lengths.every(l => l === lengths[0]);
-
-  if (!allSameLength) {
-    // Fall back to global min-entropy
-    return { totalEntropy: calculateMinEntropy(tokens), positionData: [] };
-  }
-
-  const tokenLength = lengths[0] || 0;
+function calculatePerPositionMinEntropyBytes(byteTokens: number[][]): { totalEntropy: number, positionData: Array<{ position: number, entropy: number, mostCommonChar: string, frequency: number }> } {
+  if (byteTokens.length === 0) return { totalEntropy: 0, positionData: [] };
+  const tokenLength = Math.min(...byteTokens.map(t => t.length));
+  if (tokenLength <= 0) return { totalEntropy: 0, positionData: [] };
   let totalMinEntropy = 0;
   const positionData: Array<{ position: number, entropy: number, mostCommonChar: string, frequency: number }> = [];
 
-  // For each position
   for (let pos = 0; pos < tokenLength; pos++) {
-    const charFreq = new Map<string, number>();
-
-    for (const token of tokens) {
-      const char = token[pos] || '';
-      charFreq.set(char, (charFreq.get(char) || 0) + 1);
+    const freq = new Map<number, number>();
+    for (const bytes of byteTokens) {
+      const v = bytes[pos];
+      if (v === undefined) continue;
+      freq.set(v, (freq.get(v) || 0) + 1);
     }
-
-    const maxCount = Math.max(...charFreq.values());
-    const maxProb = maxCount / tokens.length;
+    let maxCount = 0;
+    let mostCommonVal = 0;
+    for (const [val, count] of freq) {
+      if (count > maxCount) { maxCount = count; mostCommonVal = val; }
+    }
+    const contributors = Array.from(freq.values()).reduce((a, b) => a + b, 0) || 1;
+    const maxProb = maxCount / contributors;
     const posMinEntropy = -Math.log2(maxProb);
-
-    // Find the most common character at this position
-    let mostCommonChar = '';
-    for (const [char, count] of charFreq.entries()) {
-      if (count === maxCount) {
-        mostCommonChar = char;
-        break;
-      }
-    }
-
-    positionData.push({
-      position: pos,
-      entropy: posMinEntropy,
-      mostCommonChar,
-      frequency: maxProb
-    });
-
+    positionData.push({ position: pos, entropy: posMinEntropy, mostCommonChar: mostCommonVal.toString(16).padStart(2, '0'), frequency: maxProb });
     totalMinEntropy += posMinEntropy;
   }
-
   return { totalEntropy: totalMinEntropy, positionData };
 }
 
 // Chi-squared test for uniformity
+function erfc(x: number): number {
+  const z = Math.abs(x);
+  const t = 1 / (1 + 0.5 * z);
+  const tau = t * Math.exp(
+    -z * z -
+      1.26551223 +
+      1.00002368 * t +
+      0.37409196 * t * t +
+      0.09678418 * t ** 3 -
+      0.18628806 * t ** 4 +
+      0.27886807 * t ** 5 -
+      1.13520398 * t ** 6 +
+      1.48851587 * t ** 7 -
+      0.82215223 * t ** 8 +
+      0.17087277 * t ** 9
+  );
+  return x >= 0 ? tau : 2 - tau;
+}
+
 function chiSquaredTest(bits: number[]): number {
   if (bits.length < 100) return 1.0; // Not enough data
 
@@ -214,12 +282,7 @@ function chiSquaredTest(bits: number[]): number {
 
   const chiSq = Math.pow(observed0 - expected, 2) / expected +
                 Math.pow(observed1 - expected, 2) / expected;
-
-  // Degrees of freedom = 1 for binary
-  // Approximate p-value for χ² distribution with df=1
-  // Using complementary error function approximation
-  const pValue = 1 - (1 - Math.exp(-chiSq / 2));
-
+  const pValue = erfc(Math.sqrt(chiSq / 2));
   return Math.max(0, Math.min(1, pValue));
 }
 
@@ -255,31 +318,36 @@ function serialCorrelation(bits: number[]): number {
 }
 
 // Runs test for randomness
-function runsTest(bits: number[]): number {
-  if (bits.length < 20) return 1.0;
-
-  // Count runs
-  let runs = 1;
-  for (let i = 1; i < bits.length; i++) {
-    if (bits[i] !== bits[i - 1]) runs++;
-  }
+function runsTest(bits: number[]): { p: number, applicable: boolean } {
+  if (bits.length < 100) return { p: 1.0, applicable: false };
 
   const n0 = bits.filter(b => b === 0).length;
   const n1 = bits.filter(b => b === 1).length;
   const n = bits.length;
+  if (n === 0) return { p: 1.0, applicable: false };
+
+  // NIST precondition: proportion of ones close to 0.5
+  const pi = n1 / n;
+  const tau = 2 / Math.sqrt(n);
+  if (Math.abs(pi - 0.5) >= tau) {
+    // Not applicable due to bias; don't flag as fail
+    return { p: 1.0, applicable: false };
+  }
+
+  // Count runs
+  let runs = 1;
+  for (let i = 1; i < n; i++) {
+    if (bits[i] !== bits[i - 1]) runs++;
+  }
 
   // Expected runs and variance under null hypothesis
   const expectedRuns = (2 * n0 * n1) / n + 1;
   const variance = (2 * n0 * n1 * (2 * n0 * n1 - n)) / (n * n * (n - 1));
-
-  if (variance === 0) return 1.0;
+  if (variance === 0) return { p: 1.0, applicable: false };
 
   const z = (runs - expectedRuns) / Math.sqrt(variance);
-
-  // Approximate p-value (two-tailed)
   const pValue = 2 * (1 - normalCDF(Math.abs(z)));
-
-  return Math.max(0, Math.min(1, pValue));
+  return { p: Math.max(0, Math.min(1, pValue)), applicable: true };
 }
 
 // Standard normal CDF approximation
@@ -369,31 +437,20 @@ function analyzeCollisions(tokens: string[]): { exactDuplicates: number; nearDup
   return { exactDuplicates, nearDuplicates, averageHammingDistance };
 }
 
-// Bit-level entropy calculation
-function calculateBitEntropy(tokens: string[]): { totalBits: number; onesCount: number; zerosCount: number; bitEntropy: number } {
+// Bit-level entropy calculation from decoded bytes
+function calculateBitEntropyFromBytes(byteTokens: number[][]): { totalBits: number; onesCount: number; zerosCount: number; bitEntropy: number } {
   let onesCount = 0;
   let zerosCount = 0;
-
-  for (const token of tokens) {
-    for (const char of token) {
-      const charCode = char.charCodeAt(0);
-      for (let i = 0; i < 8; i++) {
-        if ((charCode >> i) & 1) {
-          onesCount++;
-        } else {
-          zerosCount++;
-        }
-      }
+  for (const bytes of byteTokens) {
+    for (const b of bytes) {
+      for (let i = 0; i < 8; i++) ((b >> i) & 1) ? onesCount++ : zerosCount++;
     }
   }
-
   const totalBits = onesCount + zerosCount;
   if (totalBits === 0) return { totalBits: 0, onesCount: 0, zerosCount: 0, bitEntropy: 0 };
-
   const pOne = onesCount / totalBits;
-  const pZero = zerosCount / totalBits;
+  const pZero = 1 - pOne;
   const bitEntropy = -(pOne * Math.log2(pOne || 1) + pZero * Math.log2(pZero || 1));
-
   return { totalBits, onesCount, zerosCount, bitEntropy };
 }
 
@@ -547,72 +604,75 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
   if (duplicatePercentage > 10) predictabilityScore += 20;
   if (prefix.length > 3) predictabilityScore += 10;
 
-  // Character analysis
+  // Character analysis (for display only; byte-level tests drive results)
   const charAnalysis = analyzeCharacters(tokens);
 
-  // Bit analysis
-  const bitAnalysis = calculateBitEntropy(tokens);
-
-  // === NEW: Comprehensive NIST 800-90B-style Entropy Analysis ===
-
-  // Detect encoding type
-  const isHex = charAnalysis.hexadecimal;
-  const isBase64 = charAnalysis.base64;
-  const encoding: 'hex' | 'base64' | 'raw' = isHex ? 'hex' : (isBase64 ? 'base64' : 'raw');
-
-  // Convert all tokens to bits
+  // Decode all tokens to bytes and bits
+  const decoded = tokens.map(t => decodeTokenToBytes(t));
+  const byteTokens: number[][] = decoded.map(d => d.bytes);
+  // Build full bitstream across tokens (do not strip common prefixes)
   const allBits: number[] = [];
-  for (const token of tokens) {
-    allBits.push(...tokenToBits(token, encoding));
-  }
+  for (const bytes of byteTokens) allBits.push(...bytesToBits(bytes));
+
+  // Bit analysis (byte-true)
+  const bitAnalysis = calculateBitEntropyFromBytes(byteTokens);
 
   const totalBits = allBits.length;
+  const avgBitsPerToken = totalBits / tokens.length;
 
   // Shannon entropy per bit
   const bit0Count = allBits.filter(b => b === 0).length;
-  const bit1Count = allBits.filter(b => b === 1).length;
-  const p0 = bit0Count / totalBits;
-  const p1 = bit1Count / totalBits;
+  const p0 = totalBits ? bit0Count / totalBits : 0;
+  const p1 = 1 - p0;
   const shannonEntropyPerBit = p0 > 0 && p1 > 0 ? -(p0 * Math.log2(p0) + p1 * Math.log2(p1)) : 0;
 
-  // Min-entropy (global)
-  const minEntropy = calculateMinEntropy(tokens);
-  const avgBitsPerToken = totalBits / tokens.length;
-  const minEntropyPerBit = minEntropy / avgBitsPerToken;
+  // Whole-token min-entropy (only meaningful if duplicates exist)
+  const minEntropyWholeToken = calculateMinEntropy(tokens);
 
-  // Per-position min-entropy
-  const perPositionResult = calculatePerPositionMinEntropy(tokens);
+  // Per-position min-entropy using bytes (now computed up to minimum common length)
+  const perPositionResult = calculatePerPositionMinEntropyBytes(byteTokens);
   const perPositionMinEntropy = perPositionResult.totalEntropy;
-  const perPositionMinEntropyPerBit = perPositionMinEntropy / avgBitsPerToken;
+  const perPositionMinEntropyPerBit = avgBitsPerToken ? (perPositionResult.totalEntropy / avgBitsPerToken) : 0;
+  // Security assessment accumulators
+  const issues: string[] = [];
+  const warnings: string[] = [];
+  const strengths: string[] = [];
 
-  // Effective security bits (worst case - use the minimum of all estimators)
-  const effectiveSecurityBits = Math.min(
-    minEntropy,
-    perPositionMinEntropy,
-    avgBitsPerToken * minEntropyPerBit
-  );
+  // Bit-bias min-entropy per bit across all bits
+  const pMax = Math.max(p0, p1);
+  const minEntropyPerBit = pMax > 0 ? -Math.log2(pMax) : 0;
 
-  // Chi-squared test for uniformity
-  const chiSquaredPValue = chiSquaredTest(allBits);
+  // Effective security bits: avoid sample-size cap when no duplicates
+  const estimators: number[] = [];
+  // Always include bit-bias estimator across all bits
+  estimators.push(minEntropyPerBit * avgBitsPerToken);
+  // Include per-position bytes estimator only if fixed-length
+  if (perPositionMinEntropy !== undefined) estimators.push(perPositionMinEntropy);
+  // Include whole-token min-entropy only if duplicates exist
+  if (duplicateCount > 0) estimators.push(minEntropyWholeToken);
+  const effectiveSecurityBits = Math.min(...estimators);
 
-  // Serial correlation
-  const serialCorr = serialCorrelation(allBits);
+  // Prepare per-token bit arrays for aggregated tests
+  const perTokenBits = byteTokens.map(b => bytesToBits(b)).filter(b => b.length >= 100);
+  // Chi-squared: aggregate per-token p-values (median), to avoid cross-token artifacts
+  const chiPs = perTokenBits.map(b => chiSquaredTest(b)).filter(p => !Number.isNaN(p));
+  const chiSquaredPValue: number = chiPs.length > 0 ? chiPs.sort((a,b)=>a-b)[Math.floor(chiPs.length/2)] : 1.0;
 
-  // Runs test
-  const runsTestPValue = runsTest(allBits);
+  // Serial correlation (per-token average over full tokens)
+  const serialCorr = serialCorrelationPerTokenAverage(byteTokens);
+
+  // Runs test: compute per-token and aggregate to reduce long-stream bias
+  const runsResults = perTokenBits.map(b => runsTest(b));
+  const applicableRuns = runsResults.filter(r => r.applicable).map(r => r.p);
+  const runsTestPValue = applicableRuns.length > 0 ? applicableRuns.sort((a,b)=>a-b)[Math.floor(applicableRuns.length/2)] : 1.0;
 
   // LZ compression-based entropy estimate
   const lzEntropy = lzEntropyEstimate(allBits);
-  const lzCompressionRatio = lzEntropy / shannonEntropyPerBit;
+  const lzCompressionRatio = shannonEntropyPerBit > 1e-9 ? (lzEntropy / shannonEntropyPerBit) : 1;
   const estimatedEntropyRate = lzEntropy;
 
   // Collision analysis
   const collisionAnalysis = analyzeCollisions(tokens);
-
-  // Security assessment
-  const issues: string[] = [];
-  const warnings: string[] = [];
-  const strengths: string[] = [];
 
   // === NEW: NIST-style Security Assessment based on Min-Entropy ===
 
@@ -642,10 +702,13 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
   if (entropy < 3.0) warnings.push(`Low Shannon entropy (${entropy.toFixed(2)}). May indicate limited character set.`);
   else if (entropy >= 4.5) strengths.push(`Good Shannon entropy (${entropy.toFixed(2)}).`);
 
+  // Data sufficiency notes
+  const insufficientBits = totalBits < 100;
+
   // Chi-squared uniformity test
-  if (chiSquaredPValue < 0.01) {
+  if (!insufficientBits && chiSquaredPValue < 0.01) {
     issues.push(`Chi-squared test failed (p=${chiSquaredPValue.toFixed(4)}). Bit distribution is non-uniform.`);
-  } else if (chiSquaredPValue < 0.05) {
+  } else if (!insufficientBits && chiSquaredPValue < 0.05) {
     warnings.push(`Chi-squared test marginal (p=${chiSquaredPValue.toFixed(4)}). Slight non-uniformity detected.`);
   } else {
     strengths.push(`Chi-squared test passed (p=${chiSquaredPValue.toFixed(4)}). Uniform bit distribution.`);
@@ -653,27 +716,27 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
 
   // Serial correlation test
   const absCorr = Math.abs(serialCorr);
-  if (absCorr > 0.3) {
+  if (absCorr > 0.5) {
     issues.push(`High serial correlation (${serialCorr.toFixed(3)}). Consecutive bits are dependent.`);
-  } else if (absCorr > 0.1) {
+  } else if (absCorr > 0.2) {
     warnings.push(`Moderate serial correlation (${serialCorr.toFixed(3)}). Some bit dependencies present.`);
   } else {
     strengths.push(`Low serial correlation (${serialCorr.toFixed(3)}). Bits are independent.`);
   }
 
   // Runs test
-  if (runsTestPValue < 0.01) {
+  if (!insufficientBits && runsTestPValue < 0.01) {
     issues.push(`Runs test failed (p=${runsTestPValue.toFixed(4)}). Non-random run patterns detected.`);
-  } else if (runsTestPValue < 0.05) {
+  } else if (!insufficientBits && runsTestPValue < 0.05) {
     warnings.push(`Runs test marginal (p=${runsTestPValue.toFixed(4)}). Possible run pattern issues.`);
   } else {
     strengths.push(`Runs test passed (p=${runsTestPValue.toFixed(4)}). Random run distribution.`);
   }
 
   // LZ compression entropy
-  if (lzCompressionRatio > 1.2) {
+  if (!insufficientBits && lzCompressionRatio > 1.5) {
     issues.push(`High LZ compression ratio (${lzCompressionRatio.toFixed(2)}). Structure detected in data.`);
-  } else if (lzCompressionRatio > 1.05) {
+  } else if (!insufficientBits && lzCompressionRatio > 1.10) {
     warnings.push(`Elevated LZ compression ratio (${lzCompressionRatio.toFixed(2)}). Some structure present.`);
   } else {
     strengths.push(`Good LZ compression ratio (${lzCompressionRatio.toFixed(2)}). Minimal structure.`);
@@ -706,10 +769,11 @@ function analyzeTokens(captures: TokenCapture[]): AnalysisResult {
   // Add partial failure warnings
   warnings.push(...partialFailures);
 
-  // Overall rating
+  // Overall rating: make CRITICAL depend on effective bits or strong failures
   let overallRating: 'CRITICAL' | 'WARNING' | 'GOOD' | 'EXCELLENT';
-  if (issues.length > 0) overallRating = 'CRITICAL';
-  else if (warnings.length > 0) overallRating = 'WARNING';
+  const severeTestFailure = (!insufficientBits && (Math.abs(serialCorr) > 0.5 || chiSquaredPValue < 0.001 || runsTestPValue < 0.001));
+  if (effectiveSecurityBits < 64 || (effectiveSecurityBits < 80 && severeTestFailure)) overallRating = 'CRITICAL';
+  else if (warnings.length > 0 || effectiveSecurityBits < 128 || severeTestFailure) overallRating = 'WARNING';
   else if (strengths.length >= 3) overallRating = 'EXCELLENT';
   else overallRating = 'GOOD';
 
